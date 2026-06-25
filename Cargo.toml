@@ -1,0 +1,12 @@
+[workspace]
+members = ["crates/video-pipeline"]
+
+[package]
+name = "video-sandbox"
+version = "0.1.0"
+edition = "2024"
+
+# src/ 直下は実験用バイナリ。フレームワーク本体は crates/video-pipeline。
+[dependencies]
+video-pipeline = { path = "crates/video-pipeline" }
+anyhow = "1"

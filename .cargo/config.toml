@@ -1,0 +1,7 @@
+# Build-time environment for rsmpeg / rusty_ffmpeg (FFmpeg bindings).
+# Points at the in-repo FFmpeg 8.1 *dev* build (include/ + lib/).
+# LIBCLANG_PATH is needed by bindgen to parse the FFmpeg headers.
+[env]
+FFMPEG_INCLUDE_DIR = { value = "ffmpeg-8.1/include", relative = true, force = true }
+FFMPEG_LIBS_DIR = { value = "ffmpeg-8.1/lib", relative = true, force = true }
+LIBCLANG_PATH = "C:\\Program Files\\Microsoft Visual Studio\\18\\Community\\VC\\Tools\\Llvm\\x64\\bin"

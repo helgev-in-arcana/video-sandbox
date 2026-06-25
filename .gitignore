@@ -1,0 +1,22 @@
+# ビルド成果物
+/target
+
+# 同梱 FFmpeg 8.1 dev ビルド（100MB超のバイナリ。各自で再配置する）
+# 配置先: ffmpeg-8.1/{include,lib,bin} ← BtbN の win64-gpl-shared-8.1
+/ffmpeg-8.1
+
+# 動画・画像（サンプル/出力含む）
+*.mp4
+*.mov
+*.mkv
+*.avi
+*.webm
+*.gif
+*.png
+*.jpg
+*.jpeg
+*.bmp
+*.webp
+
+# ドキュメント（仕様・調査メモ等）
+*.md
