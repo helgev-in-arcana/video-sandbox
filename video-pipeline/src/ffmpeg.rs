@@ -4,7 +4,7 @@
 use std::ffi::CString;
 use std::ptr::copy_nonoverlapping;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, Result};
 use rsmpeg::avcodec::{AVCodec, AVCodecContext};
 use rsmpeg::avformat::{AVFormatContextInput, AVFormatContextOutput};
 use rsmpeg::avutil::{ra, AVFrame, AVHWDeviceContext};
@@ -13,6 +13,7 @@ use rsmpeg::ffi;
 use rsmpeg::swscale::SwsContext;
 
 use crate::frame::Frame;
+use crate::pipeline::HwAccel;
 use crate::pixel::Pixel;
 
 /// 行ごとに linesize 分の stride を詰めて、パック済みの [`Pixel`] 列を作る。
@@ -56,7 +57,10 @@ unsafe extern "C" fn get_format_hw(
 
 /// 入力を開き、各フレームを RGBA8 化して yield する Iterator を返す。
 /// 開けなかった場合は警告を出して空 Iterator を返す（ソースは無謬な Iterator）。
-pub fn decode_iter(path: &str, hwaccel: Option<&str>) -> Box<dyn Iterator<Item = Frame> + Send> {
+pub fn decode_iter(
+    path: &str,
+    hwaccel: Option<HwAccel>,
+) -> Box<dyn Iterator<Item = Frame> + Send> {
     match Decoder::open(path, hwaccel) {
         Ok(d) => Box::new(d),
         Err(e) => {
@@ -75,7 +79,7 @@ struct Decoder {
 }
 
 impl Decoder {
-    fn open(path: &str, hwaccel: Option<&str>) -> Result<Self> {
+    fn open(path: &str, hwaccel: Option<HwAccel>) -> Result<Self> {
         let path_c = CString::new(path)?;
         let input = AVFormatContextInput::open(&path_c)?;
         let (stream_index, decoder) = input
@@ -87,22 +91,20 @@ impl Decoder {
             decode_ctx.apply_codecpar(&stream.codecpar())?;
         }
 
-        // HW デコードの選択（[`DecodeSettings::hwaccel`]）。例: d3d11va（AMD/Windows 汎用）/ dxva2。
-        // フレームは GPU サーフェスで返るので、next() で hwframe_transfer_data によりシステム
-        // メモリへ落としてから sws→RGBA に流す。
-        if let Some(kind) = hwaccel.filter(|s| !s.is_empty()) {
+        // HW デコードの選択（[`DecodeSettings::hwaccel`]）。フレームは GPU サーフェスで返るので、
+        // next() で hwframe_transfer_data によりシステムメモリへ落としてから sws→RGBA に流す。
+        if let Some(kind) = hwaccel {
             let dev_type = match kind {
-                "d3d11va" => ffi::AV_HWDEVICE_TYPE_D3D11VA, // Windows 汎用（Intel/NVIDIA/AMD）
-                "dxva2" => ffi::AV_HWDEVICE_TYPE_DXVA2,     // Windows 汎用（旧）
-                "cuda" => ffi::AV_HWDEVICE_TYPE_CUDA,       // NVIDIA
-                "qsv" => ffi::AV_HWDEVICE_TYPE_QSV,         // Intel Quick Sync
-                "vaapi" => ffi::AV_HWDEVICE_TYPE_VAAPI,     // Linux（Intel/AMD）
-                other => bail!("未対応の hwaccel: {other}（d3d11va/dxva2/cuda/qsv/vaapi）"),
+                HwAccel::D3d11va => ffi::AV_HWDEVICE_TYPE_D3D11VA,
+                HwAccel::Dxva2 => ffi::AV_HWDEVICE_TYPE_DXVA2,
+                HwAccel::Cuda => ffi::AV_HWDEVICE_TYPE_CUDA,
+                HwAccel::Qsv => ffi::AV_HWDEVICE_TYPE_QSV,
+                HwAccel::Vaapi => ffi::AV_HWDEVICE_TYPE_VAAPI,
             };
             let hwdev = AVHWDeviceContext::create(dev_type, None, None, 0)?;
             decode_ctx.set_hw_device_ctx(hwdev);
             decode_ctx.set_get_format(Some(get_format_hw));
-            eprintln!("[dec] HW デコード: {kind}");
+            eprintln!("[dec] HW デコード: {kind:?}");
         }
 
         decode_ctx.open(None)?;
@@ -234,8 +236,7 @@ impl Encoder {
         let mut output = AVFormatContextOutput::create(&path_c)?;
 
         // 使用エンコーダ（[`EncodeSettings::encoder`]）。既定は libx264（ソフト）。
-        // 例: h264_amf（AMD HW）/ h264_nvenc / h264_qsv。
-        let enc_name = settings.encoder.as_deref().unwrap_or("libx264");
+        let enc_name = settings.encoder.codec_name();
         let enc_name_c = CString::new(enc_name)?;
         let encoder = AVCodec::find_encoder_by_name(&enc_name_c)
             .ok_or_else(|| anyhow!("エンコーダ '{enc_name}' が見つかりません"))?;

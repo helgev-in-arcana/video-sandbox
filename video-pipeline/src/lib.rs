@@ -35,6 +35,6 @@ mod pixel;
 mod process;
 
 pub use frame::{Frame, FrameCtx};
-pub use pipeline::{DecodeSettings, EncodeSettings, Pipeline, VideoFile};
+pub use pipeline::{DecodeSettings, EncodeSettings, HwAccel, Pipeline, VideoEncoder, VideoFile};
 pub use pixel::{Hsv, Pixel};
 pub use process::Process;

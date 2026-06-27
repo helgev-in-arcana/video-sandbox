@@ -10,30 +10,68 @@ use crate::ffmpeg::{decode_iter, Encoder};
 use crate::frame::{Frame, FrameCtx};
 use crate::process::Process;
 
+/// 使用する H.264 エンコーダ。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum VideoEncoder {
+    /// libx264（ソフト）。既定。
+    #[default]
+    Software,
+    /// NVIDIA NVENC（`h264_nvenc`）。
+    Nvenc,
+    /// Intel Quick Sync（`h264_qsv`）。
+    Qsv,
+    /// AMD AMF（`h264_amf`）。
+    Amf,
+}
+
+impl VideoEncoder {
+    /// `avcodec_find_encoder_by_name` に渡すコーデック名。
+    pub(crate) fn codec_name(self) -> &'static str {
+        match self {
+            VideoEncoder::Software => "libx264",
+            VideoEncoder::Nvenc => "h264_nvenc",
+            VideoEncoder::Qsv => "h264_qsv",
+            VideoEncoder::Amf => "h264_amf",
+        }
+    }
+}
+
+/// HW デコードの種類。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HwAccel {
+    /// Direct3D 11 VA（Windows 汎用・全ベンダ）。
+    D3d11va,
+    /// DirectX VA 2（Windows・旧）。
+    Dxva2,
+    /// NVIDIA CUDA。
+    Cuda,
+    /// Intel Quick Sync。
+    Qsv,
+    /// VA-API（Linux・Intel/AMD）。
+    Vaapi,
+}
+
 /// エンコード設定。実験用に必要十分な最小限。
 pub struct EncodeSettings {
     /// 出力フレームレート（fps）。出力 pts はフレーム番号で振り直す。
     pub fps: i32,
     /// 目標ビットレート（bit/s）。
     pub bit_rate: i64,
-    /// 使用する H.264 エンコーダ名。`None` なら `libx264`（ソフト）。
-    /// 例: `Some("h264_nvenc")`（NVIDIA）/ `Some("h264_qsv")`（Intel）/ `Some("h264_amf")`（AMD）。
-    pub encoder: Option<String>,
+    /// 使用するエンコーダ。既定は [`VideoEncoder::Software`]（libx264）。
+    pub encoder: VideoEncoder,
 }
 
 impl Default for EncodeSettings {
     /// 30fps・8 Mbps・ソフトエンコード（libx264）。
     fn default() -> Self {
-        EncodeSettings { fps: 30, bit_rate: 8_000_000, encoder: None }
+        EncodeSettings { fps: 30, bit_rate: 8_000_000, encoder: VideoEncoder::default() }
     }
 }
 
 /// デコード設定。
 pub struct DecodeSettings {
     /// HW デコードの種類。`None` ならソフトデコード。
-    /// 例: `Some("d3d11va")`（Windows 汎用・全ベンダ）/ `Some("cuda")`（NVIDIA）/
-    /// `Some("qsv")`（Intel）/ `Some("dxva2")` / `Some("vaapi")`（Linux）。
-    pub hwaccel: Option<String>,
+    pub hwaccel: Option<HwAccel>,
 }
 
 impl Default for DecodeSettings {
@@ -175,6 +213,6 @@ impl VideoFile {
     /// `path` のデコーダを [`DecodeSettings`] で開き、各フレームを RGBA8 化して yield する
     /// [`Pipeline`] を作る。HW デコードの選択はここで行う。
     pub fn open(path: &str, settings: DecodeSettings) -> Pipeline {
-        Pipeline { source: decode_iter(path, settings.hwaccel.as_deref()), stages: vec![] }
+        Pipeline { source: decode_iter(path, settings.hwaccel), stages: vec![] }
     }
 }
