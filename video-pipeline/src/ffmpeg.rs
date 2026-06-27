@@ -28,8 +28,9 @@ fn pack_rgba(plane: *const u8, stride: usize, width: usize, height: usize) -> Ve
     data
 }
 
-/// デコーダのフォーマット選択コールバック。候補に HW フォーマット（D3D11 / DXVA2）が
-/// あればそれを選び、無ければ先頭（ソフト）にフォールバックする。
+/// デコーダのフォーマット選択コールバック。候補のうち **HW アクセラレーション用フォーマット**
+/// （d3d11va / dxva2 / cuda / qsv / vaapi など、ベンダを問わない）があればそれを選び、
+/// 無ければ先頭（ソフト）にフォールバックする。
 unsafe extern "C" fn get_format_hw(
     _ctx: *mut ffi::AVCodecContext,
     fmts: *const ffi::AVPixelFormat,
@@ -38,7 +39,9 @@ unsafe extern "C" fn get_format_hw(
         let first = *fmts;
         let mut p = fmts;
         while *p != ffi::AV_PIX_FMT_NONE {
-            if *p == ffi::AV_PIX_FMT_D3D11 || *p == ffi::AV_PIX_FMT_DXVA2_VLD {
+            // ピクセルフォーマットが HWACCEL フラグを持つなら（=GPU サーフェス）採用。
+            let desc = ffi::av_pix_fmt_desc_get(*p);
+            if !desc.is_null() && (*desc).flags & ffi::AV_PIX_FMT_FLAG_HWACCEL as u64 != 0 {
                 return *p;
             }
             p = p.add(1);
@@ -89,9 +92,12 @@ impl Decoder {
         // メモリへ落としてから sws→RGBA に流す。
         if let Some(kind) = hwaccel.filter(|s| !s.is_empty()) {
             let dev_type = match kind {
-                "d3d11va" => ffi::AV_HWDEVICE_TYPE_D3D11VA,
-                "dxva2" => ffi::AV_HWDEVICE_TYPE_DXVA2,
-                other => bail!("未知の VS_HWDEC: {other}（d3d11va / dxva2 のみ）"),
+                "d3d11va" => ffi::AV_HWDEVICE_TYPE_D3D11VA, // Windows 汎用（Intel/NVIDIA/AMD）
+                "dxva2" => ffi::AV_HWDEVICE_TYPE_DXVA2,     // Windows 汎用（旧）
+                "cuda" => ffi::AV_HWDEVICE_TYPE_CUDA,       // NVIDIA
+                "qsv" => ffi::AV_HWDEVICE_TYPE_QSV,         // Intel Quick Sync
+                "vaapi" => ffi::AV_HWDEVICE_TYPE_VAAPI,     // Linux（Intel/AMD）
+                other => bail!("未対応の hwaccel: {other}（d3d11va/dxva2/cuda/qsv/vaapi）"),
             };
             let hwdev = AVHWDeviceContext::create(dev_type, None, None, 0)?;
             decode_ctx.set_hw_device_ctx(hwdev);

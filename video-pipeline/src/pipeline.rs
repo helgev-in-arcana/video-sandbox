@@ -17,7 +17,7 @@ pub struct EncodeSettings {
     /// 目標ビットレート（bit/s）。
     pub bit_rate: i64,
     /// 使用する H.264 エンコーダ名。`None` なら `libx264`（ソフト）。
-    /// 例: `Some("h264_amf")`（AMD HW）/ `Some("h264_nvenc")` / `Some("h264_qsv")`。
+    /// 例: `Some("h264_nvenc")`（NVIDIA）/ `Some("h264_qsv")`（Intel）/ `Some("h264_amf")`（AMD）。
     pub encoder: Option<String>,
 }
 
@@ -31,7 +31,8 @@ impl Default for EncodeSettings {
 /// デコード設定。
 pub struct DecodeSettings {
     /// HW デコードの種類。`None` ならソフトデコード。
-    /// 例: `Some("d3d11va")`（AMD/Windows 汎用）/ `Some("dxva2")`。
+    /// 例: `Some("d3d11va")`（Windows 汎用・全ベンダ）/ `Some("cuda")`（NVIDIA）/
+    /// `Some("qsv")`（Intel）/ `Some("dxva2")` / `Some("vaapi")`（Linux）。
     pub hwaccel: Option<String>,
 }
 
