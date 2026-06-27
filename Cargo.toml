@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/video-pipeline"]
+members = ["video-pipeline"]
 
 # 依存はワークスペース全体でここに集約し、各クレートは `workspace = true` で継承する。
 [workspace.dependencies]
@@ -17,7 +17,7 @@ edition = "2024"
 
 # src/ 直下は実験用バイナリ。フレームワーク本体は crates/video-pipeline。
 [dependencies]
-video-pipeline = { path = "crates/video-pipeline" }
+video-pipeline = { path = "video-pipeline" }
 anyhow = { workspace = true }
 rand = { workspace = true }
 rand_xoshiro = { workspace = true }
