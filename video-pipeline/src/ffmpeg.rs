@@ -34,7 +34,7 @@ fn pack_rgba(plane: *const u8, stride: usize, width: usize, height: usize) -> Ve
 
 /// 入力を開き、各フレームを RGBA8 化して yield する Iterator を返す。
 /// 開けなかった場合は警告を出して空 Iterator を返す（ソースは無謬な Iterator）。
-pub fn decode_iter(path: &str) -> Box<dyn Iterator<Item = Frame>> {
+pub fn decode_iter(path: &str) -> Box<dyn Iterator<Item = Frame> + Send> {
     match Decoder::open(path) {
         Ok(d) => Box::new(d),
         Err(e) => {

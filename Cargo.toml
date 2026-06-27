@@ -21,3 +21,4 @@ video-pipeline = { path = "video-pipeline" }
 anyhow = { workspace = true }
 rand = { workspace = true }
 rand_xoshiro = { workspace = true }
+rayon = { workspace = true }

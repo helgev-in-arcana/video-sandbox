@@ -513,6 +513,7 @@ dependencies = [
  "anyhow",
  "rand",
  "rand_xoshiro",
+ "rayon",
  "video-pipeline",
 ]
 

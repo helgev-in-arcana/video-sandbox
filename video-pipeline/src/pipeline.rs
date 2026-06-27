@@ -4,7 +4,7 @@
 //! 動的（`Box<dyn Process>`）。1:1 に確定しているので駆動ループは単なる `fold`。
 //! プール・ping-pong・flush 伝播・Send 境界はいずれも持たない。
 
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 
 use crate::ffmpeg::{decode_iter, Encoder};
 use crate::frame::{Frame, FrameCtx};
@@ -30,7 +30,7 @@ impl Default for EncodeSettings {
 /// [`VideoFile::new`] で作り、[`Pipeline::pipe`] / [`Pipeline::map`] で組み立て、
 /// [`Pipeline::encode_to`] で消費する。
 pub struct Pipeline {
-    source: Box<dyn Iterator<Item = Frame>>,
+    source: Box<dyn Iterator<Item = Frame> + Send>,
     stages: Vec<Box<dyn Process>>,
 }
 
@@ -43,25 +43,99 @@ impl Pipeline {
 
     /// ソースを消費し、全ステージを通して `path` に動画として書き出す。
     ///
-    /// 駆動ループの本体は `fold` 一行で、所有権がステージ間を move で流れていく。
-    /// エンコーダは最初のフレームの寸法で開かれる。フレームが 1 枚も得られなければ
-    /// エラーを返す。
-    pub fn encode_to(mut self, path: &str, settings: EncodeSettings) -> Result<()> {
-        let mut enc: Option<Encoder> = None;
-        for (index, frame) in self.source.enumerate() {
-            let ctx = FrameCtx { index: index as u64, pts: frame.pts() };
-            let out = self.stages.iter_mut().fold(frame, |f, s| s.process(f, ctx));
-            // エンコーダは最初のフレームの寸法で開く（resize ノードにも追従できる）。
-            let enc = match &mut enc {
-                Some(e) => e,
-                None => enc.insert(Encoder::new(path, out.width(), out.height(), &settings)?),
-            };
-            enc.encode(out)?;
+    /// 3 段パイプライン: **デコード**（専用スレッド）→ **処理**（このスレッド + 内部 rayon）
+    /// → **エンコード**（専用スレッド）を有界チャネルで繋ぎ、ffmpeg の I/O を処理と重ねる。
+    /// 処理段は順序を保った単一消費者なので、状態付きノード（`Feedback` 等）の結果は
+    /// 逐次実行と一致する。エンコーダは最初のフレームの寸法で開かれ、フレームが 1 枚も
+    /// 得られなければエラーを返す。
+    pub fn encode_to(self, path: &str, settings: EncodeSettings) -> Result<()> {
+        use std::sync::mpsc::sync_channel;
+        use std::time::{Duration, Instant};
+
+        // 有界チャネルの容量。小さめにしてバックプレッシャーとメモリ上限を効かせる。
+        const CAP: usize = 4;
+
+        let Pipeline { mut source, mut stages } = self;
+        let path = path.to_string();
+
+        let (dec_tx, dec_rx) = sync_channel::<Frame>(CAP);
+        let (enc_tx, enc_rx) = sync_channel::<Frame>(CAP);
+
+        // --- デコード専用スレッド: source.next() の結果を流すだけ ---
+        let dec_handle = std::thread::spawn(move || {
+            let mut busy = Duration::ZERO;
+            loop {
+                let t = Instant::now();
+                let frame = source.next();
+                busy += t.elapsed();
+                match frame {
+                    // 送信ブロック（バックプレッシャー）は busy に含めない。
+                    Some(f) => {
+                        if dec_tx.send(f).is_err() {
+                            break; // 下流が落ちた
+                        }
+                    }
+                    None => break,
+                }
+            }
+            busy
+        });
+
+        // --- エンコード専用スレッド: 最初のフレームでエンコーダを開き、流れてくる順に書く ---
+        let enc_handle = std::thread::spawn(move || -> Result<(Duration, u64)> {
+            let mut enc: Option<Encoder> = None;
+            let mut busy = Duration::ZERO;
+            let mut frames = 0u64;
+            for frame in enc_rx {
+                let enc = match &mut enc {
+                    Some(e) => e,
+                    None => {
+                        enc.insert(Encoder::new(&path, frame.width(), frame.height(), &settings)?)
+                    }
+                };
+                let t = Instant::now();
+                enc.encode(frame)?;
+                busy += t.elapsed();
+                frames += 1;
+            }
+            match enc {
+                Some(e) => e.finish()?,
+                None => bail!("ソースからフレームが 1 枚も得られませんでした"),
+            }
+            Ok((busy, frames))
+        });
+
+        // --- 処理段（このスレッド）: デコード結果を順に受け、全ステージを通して送る ---
+        let mut t_process = Duration::ZERO;
+        let mut index = 0u64;
+        for frame in dec_rx {
+            let ctx = FrameCtx { index, pts: frame.pts() };
+            let t = Instant::now();
+            let out = stages.iter_mut().fold(frame, |f, s| s.process(f, ctx));
+            t_process += t.elapsed();
+            if enc_tx.send(out).is_err() {
+                break; // エンコードスレッドが落ちた
+            }
+            index += 1;
         }
-        match enc {
-            Some(e) => e.finish(),
-            None => bail!("ソースからフレームが 1 枚も得られませんでした"),
-        }
+        drop(enc_tx); // チャネルを閉じてエンコードスレッドを終了させる
+
+        let t_decode = dec_handle
+            .join()
+            .map_err(|_| anyhow!("デコードスレッドが panic しました"))?;
+        let (t_encode, frames) = enc_handle
+            .join()
+            .map_err(|_| anyhow!("エンコードスレッドが panic しました"))??;
+
+        eprintln!(
+            "[計測] {frames} フレーム（各段の busy 時間）: \
+             デコード {:.2}s / 処理 {:.2}s / エンコード {:.2}s",
+            t_decode.as_secs_f32(),
+            t_process.as_secs_f32(),
+            t_encode.as_secs_f32(),
+        );
+
+        Ok(())
     }
 }
 
