@@ -88,6 +88,8 @@ impl Default for DecodeSettings {
 pub struct Pipeline {
     source: Box<dyn Iterator<Item = Frame> + Send>,
     stages: Vec<Box<dyn Process>>,
+    /// コンテナが申告する総フレーム数（不明なら `None`）。進捗表示に使う。
+    total_frames: Option<u64>,
 }
 
 impl Pipeline {
@@ -105,13 +107,14 @@ impl Pipeline {
     /// 逐次実行と一致する。エンコーダは最初のフレームの寸法で開かれ、フレームが 1 枚も
     /// 得られなければエラーを返す。
     pub fn encode_to(self, path: &str, settings: EncodeSettings) -> Result<()> {
+        use std::io::Write;
         use std::sync::mpsc::sync_channel;
         use std::time::{Duration, Instant};
 
         // 有界チャネルの容量。小さめにしてバックプレッシャーとメモリ上限を効かせる。
         const CAP: usize = 4;
 
-        let Pipeline { mut source, mut stages } = self;
+        let Pipeline { mut source, mut stages, total_frames } = self;
         let path = path.to_string();
 
         let (dec_tx, dec_rx) = sync_channel::<Frame>(CAP);
@@ -173,7 +176,20 @@ impl Pipeline {
                 break; // エンコードスレッドが落ちた
             }
             index += 1;
+
+            // 進捗表示（同じ行を上書き）。総数が分かれば割合も出す。
+            let mut err = std::io::stderr().lock();
+            match total_frames {
+                Some(t) => {
+                    let _ = write!(err, "\r[進捗] {index}/{t} ({:.1}%)", index as f64 / t as f64 * 100.0);
+                }
+                None => {
+                    let _ = write!(err, "\r[進捗] {index} フレーム");
+                }
+            }
+            let _ = err.flush();
         }
+        eprintln!(); // 進捗行を確定（以降のログを次の行へ）
         drop(enc_tx); // チャネルを閉じてエンコードスレッドを終了させる
 
         let t_decode = dec_handle
@@ -213,6 +229,7 @@ impl VideoFile {
     /// `path` のデコーダを [`DecodeSettings`] で開き、各フレームを RGBA8 化して yield する
     /// [`Pipeline`] を作る。HW デコードの選択はここで行う。
     pub fn open(path: &str, settings: DecodeSettings) -> Pipeline {
-        Pipeline { source: decode_iter(path, settings.hwaccel), stages: vec![] }
+        let (source, total_frames) = decode_iter(path, settings.hwaccel);
+        Pipeline { source, stages: vec![], total_frames }
     }
 }

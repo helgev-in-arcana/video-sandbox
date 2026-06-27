@@ -1,5 +1,6 @@
 use video_pipeline::{Frame, FrameCtx, Process};
 
+#[derive(Clone)]
 pub struct Feedback<MX, FW, FB>
 where
     MX: FnMut(Frame, Frame, FrameCtx) -> Frame,

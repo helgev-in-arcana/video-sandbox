@@ -55,17 +55,21 @@ unsafe extern "C" fn get_format_hw(
 // デコード（ソース）
 // ---------------------------------------------------------------------------
 
-/// 入力を開き、各フレームを RGBA8 化して yield する Iterator を返す。
-/// 開けなかった場合は警告を出して空 Iterator を返す（ソースは無謬な Iterator）。
+/// 入力を開き、各フレームを RGBA8 化して yield する Iterator と、コンテナが申告する
+/// 総フレーム数（不明なら `None`）を返す。開けなかった場合は警告を出して空 Iterator を
+/// 返す（ソースは無謬な Iterator）。
 pub fn decode_iter(
     path: &str,
     hwaccel: Option<HwAccel>,
-) -> Box<dyn Iterator<Item = Frame> + Send> {
+) -> (Box<dyn Iterator<Item = Frame> + Send>, Option<u64>) {
     match Decoder::open(path, hwaccel) {
-        Ok(d) => Box::new(d),
+        Ok(d) => {
+            let total = d.total;
+            (Box::new(d), total)
+        }
         Err(e) => {
             eprintln!("[video-sandbox] 入力 '{path}' を開けませんでした: {e:#}");
-            Box::new(std::iter::empty())
+            (Box::new(std::iter::empty()), None)
         }
     }
 }
@@ -76,6 +80,8 @@ struct Decoder {
     stream_index: usize,
     sws: Option<SwsContext>,
     flushed: bool,
+    /// コンテナが申告する総フレーム数（不明なら `None`）。進捗表示に使う。
+    total: Option<u64>,
 }
 
 impl Decoder {
@@ -86,10 +92,12 @@ impl Decoder {
             .find_best_stream(ffi::AVMEDIA_TYPE_VIDEO)?
             .ok_or_else(|| anyhow!("動画ストリームが見つかりません"))?;
         let mut decode_ctx = AVCodecContext::new(&decoder);
-        {
+        let total = {
             let stream = &input.streams()[stream_index];
             decode_ctx.apply_codecpar(&stream.codecpar())?;
-        }
+            // nb_frames は 0 / 不明のことがある。その場合は None。
+            (stream.nb_frames > 0).then_some(stream.nb_frames as u64)
+        };
 
         // HW デコードの選択（[`DecodeSettings::hwaccel`]）。フレームは GPU サーフェスで返るので、
         // next() で hwframe_transfer_data によりシステムメモリへ落としてから sws→RGBA に流す。
@@ -108,7 +116,7 @@ impl Decoder {
         }
 
         decode_ctx.open(None)?;
-        Ok(Decoder { input, decode_ctx, stream_index, sws: None, flushed: false })
+        Ok(Decoder { input, decode_ctx, stream_index, sws: None, flushed: false, total })
     }
 
     /// HW サーフェスなら GPU からシステムメモリへ転送する。ソフトフレームはそのまま返す。
