@@ -90,17 +90,38 @@ impl Frame {
 
     /// 行と列を入れ替えた新しいフレームを返す（`width` と `height` が入れ替わる）。
     ///
-    /// `dst[x][y] = src[y][x]`。ピクセル単位でコピーする愚直な実装で、大きなフレームでは
-    /// キャッシュ効率が悪い（タイル化は将来の最適化対象）。`pts` は引き継ぐ。
+    /// `dst[x][y] = src[y][x]`。出力を `T` 行ずつの帯に分割して **rayon で並列化**し、
+    /// 各帯の中は `T×T` の **タイル単位**で処理してキャッシュミスを抑える。`pts` は引き継ぐ。
     pub fn transposed(&self) -> Frame {
-        let w = self.width as usize;
-        let h = self.height as usize;
-        let mut data = vec![Pixel::default(); w * h];
-        for y in 0..h {
-            for x in 0..w {
-                data[x * h + y] = self.data[y * w + x];
+        // タイルの一辺（ピクセル）。T×T×4B（T=64 で 16KB）で読み書きとも L1 に収まる。
+        // 実測で 16/32/64 のうち 64 が最速だったため採用。
+        const T: usize = 64;
+        let w = self.width as usize; // src 幅（= dst の 1 行の長さ／高さ方向）
+        let h = self.height as usize; // src 高さ（= dst の 1 行の長さ）
+        let src = &self.data;
+        // dst は width=h, height=w。行 x（src の列）、列 y（src の行）で dst[x*h + y]。
+        // 全画素をちょうど 1 回ずつ書くので、ゼロ初期化は無駄。未初期化で確保する。
+        // SAFETY: Pixel は Copy（Drop なし）。下のループが全 w*h 要素を読む前に書く。
+        let mut data: Vec<Pixel> = Vec::with_capacity(w * h);
+        unsafe { data.set_len(w * h) };
+
+        // dst を「T 行ぶん」の帯に分割。帯どうしは互いに素な可変スライスなので並列で安全。
+        data.par_chunks_mut(T * h).enumerate().for_each(|(b, band)| {
+            let x0 = b * T; // この帯の先頭 dst 行 = src 列の開始
+            let rows = band.len() / h; // 端の帯では < T
+            // 列方向（src 行 = dst 列）も T ずつタイル化し、T×T ブロックを順に埋める。
+            for yb in (0..h).step_by(T) {
+                let y_end = (yb + T).min(h);
+                for dx in 0..rows {
+                    let x = x0 + dx; // src 列
+                    let dst_row = &mut band[dx * h..dx * h + h];
+                    for y in yb..y_end {
+                        dst_row[y] = src[y * w + x];
+                    }
+                }
             }
-        }
+        });
+
         // 転置後は幅と高さが入れ替わる。
         Frame { width: self.height, height: self.width, data, pts: self.pts }
     }
@@ -123,6 +144,34 @@ impl Frame {
             .par_chunks_mut(width)
             .enumerate()
             .for_each(|(y, row)| f(ctx, y, row));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// タイル化転置が `T[a][b] == F[b][a]` を満たすことを、タイル境界を跨ぐ非正方・
+    /// 非 32 倍数サイズで検証する（端の帯 `rows < T` と部分タイル `y_end` を踏む）。
+    #[test]
+    fn transposed_matches_definition() {
+        let (w, h) = (37u32, 53u32);
+        let mut f = Frame::black(w, h, 7);
+        for y in 0..h {
+            for x in 0..w {
+                f.set_pixel(x, y, Pixel::new(x as u8, y as u8, (x ^ y) as u8, 255));
+            }
+        }
+        let t = f.transposed();
+        assert_eq!(t.width(), h);
+        assert_eq!(t.height(), w);
+        assert_eq!(t.pts(), f.pts());
+        for y in 0..h {
+            for x in 0..w {
+                // 転置: T.get_pixel(y, x) == F.get_pixel(x, y)
+                assert_eq!(t.get_pixel(y, x), f.get_pixel(x, y), "({x}, {y}) で不一致");
+            }
+        }
     }
 }
 
