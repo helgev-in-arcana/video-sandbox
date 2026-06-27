@@ -7,8 +7,8 @@
 use anyhow::{bail, Result};
 
 use crate::ffmpeg::{decode_iter, Encoder};
-use crate::frame::Frame;
-use crate::process::{MapNode, Process, ProcessCtx};
+use crate::frame::{Frame, FrameCtx};
+use crate::process::Process;
 
 /// エンコード設定。実験用に必要十分な最小限。
 pub struct EncodeSettings {
@@ -41,14 +41,6 @@ impl Pipeline {
         self
     }
 
-    /// 使い捨てのインライン実験用ヘルパ。クロージャを [`Process`] として挿す。
-    ///
-    /// クロージャは `(Frame, ProcessCtx) -> Frame` で、[`ProcessCtx`] からフレーム番号
-    /// やタイムスタンプを参照できる。
-    pub fn map(self, f: impl FnMut(Frame, ProcessCtx) -> Frame + 'static) -> Self {
-        self.pipe(MapNode(f))
-    }
-
     /// ソースを消費し、全ステージを通して `path` に動画として書き出す。
     ///
     /// 駆動ループの本体は `fold` 一行で、所有権がステージ間を move で流れていく。
@@ -57,12 +49,12 @@ impl Pipeline {
     pub fn encode_to(mut self, path: &str, settings: EncodeSettings) -> Result<()> {
         let mut enc: Option<Encoder> = None;
         for (index, frame) in self.source.enumerate() {
-            let ctx = ProcessCtx { index: index as u64, pts: frame.pts };
+            let ctx = FrameCtx { index: index as u64, pts: frame.pts() };
             let out = self.stages.iter_mut().fold(frame, |f, s| s.process(f, ctx));
             // エンコーダは最初のフレームの寸法で開く（resize ノードにも追従できる）。
             let enc = match &mut enc {
                 Some(e) => e,
-                None => enc.insert(Encoder::new(path, out.width, out.height, &settings)?),
+                None => enc.insert(Encoder::new(path, out.width(), out.height(), &settings)?),
             };
             enc.encode(out)?;
         }

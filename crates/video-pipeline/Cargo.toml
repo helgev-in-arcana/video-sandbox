@@ -5,5 +5,9 @@ edition = "2024"
 description = "実験用 動画ピクセルパイプライン（push / 1:1 / RGBA8）"
 
 [dependencies]
-rsmpeg = { version = "0.18", default-features = false, features = ["ffmpeg8"] }
-anyhow = "1"
+rsmpeg = { workspace = true }
+anyhow = { workspace = true }
+rayon = { workspace = true }
+rand = { workspace = true }
+rand_xoshiro = { workspace = true }
+bytemuck = { workspace = true }

@@ -1,6 +1,15 @@
 [workspace]
 members = ["crates/video-pipeline"]
 
+# 依存はワークスペース全体でここに集約し、各クレートは `workspace = true` で継承する。
+[workspace.dependencies]
+anyhow = "1.0.103"
+rand = "0.10.1"
+rand_xoshiro = "0.8.1"
+rayon = "1.12.0"
+bytemuck = { version = "1.25.0", features = ["derive"] }
+rsmpeg = { version = "0.18.0", default-features = false, features = ["ffmpeg8"] }
+
 [package]
 name = "video-sandbox"
 version = "0.1.0"
@@ -9,4 +18,6 @@ edition = "2024"
 # src/ 直下は実験用バイナリ。フレームワーク本体は crates/video-pipeline。
 [dependencies]
 video-pipeline = { path = "crates/video-pipeline" }
-anyhow = "1"
+anyhow = { workspace = true }
+rand = { workspace = true }
+rand_xoshiro = { workspace = true }

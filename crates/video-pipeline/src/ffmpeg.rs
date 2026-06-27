@@ -13,14 +13,16 @@ use rsmpeg::ffi;
 use rsmpeg::swscale::SwsContext;
 
 use crate::frame::Frame;
+use crate::pixel::Pixel;
 
-/// 行ごとに linesize 分の stride を詰めて、RGBA8 のパック済み `Vec` を作る。
-fn pack_rgba(plane: *const u8, stride: usize, width: usize, height: usize) -> Vec<u8> {
+/// 行ごとに linesize 分の stride を詰めて、パック済みの [`Pixel`] 列を作る。
+fn pack_rgba(plane: *const u8, stride: usize, width: usize, height: usize) -> Vec<Pixel> {
+    let mut data = vec![Pixel::default(); width * height];
+    let dst: &mut [u8] = bytemuck::cast_slice_mut(&mut data);
     let row = width * 4;
-    let mut data = vec![0u8; row * height];
     for y in 0..height {
         unsafe {
-            copy_nonoverlapping(plane.add(y * stride), data.as_mut_ptr().add(y * row), row);
+            copy_nonoverlapping(plane.add(y * stride), dst.as_mut_ptr().add(y * row), row);
         }
     }
     data
@@ -99,7 +101,7 @@ impl Decoder {
             .expect("sws_scale (decode) 失敗");
 
         let data = pack_rgba(dst.data[0], dst.linesize[0] as usize, w as usize, h as usize);
-        Frame { width: w as u32, height: h as u32, data, pts: src.pts }
+        Frame::from_rgba(w as u32, h as u32, data, src.pts)
     }
 }
 
@@ -228,7 +230,7 @@ impl Encoder {
             for y in 0..self.height as usize {
                 unsafe {
                     copy_nonoverlapping(
-                        frame.data.as_ptr().add(y * row),
+                        frame.data().as_ptr().add(y * row),
                         plane.add(y * stride),
                         row,
                     );

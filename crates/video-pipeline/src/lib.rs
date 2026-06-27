@@ -31,8 +31,10 @@
 mod ffmpeg;
 mod frame;
 mod pipeline;
+mod pixel;
 mod process;
 
-pub use frame::Frame;
+pub use frame::{Frame, FrameCtx};
 pub use pipeline::{EncodeSettings, Pipeline, VideoFile};
-pub use process::{Invert, MotionBlur, Process, ProcessCtx};
+pub use pixel::{Hsv, Pixel};
+pub use process::Process;
