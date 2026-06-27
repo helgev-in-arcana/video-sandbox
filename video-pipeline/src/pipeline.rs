@@ -16,12 +16,29 @@ pub struct EncodeSettings {
     pub fps: i32,
     /// 目標ビットレート（bit/s）。
     pub bit_rate: i64,
+    /// 使用する H.264 エンコーダ名。`None` なら `libx264`（ソフト）。
+    /// 例: `Some("h264_amf")`（AMD HW）/ `Some("h264_nvenc")` / `Some("h264_qsv")`。
+    pub encoder: Option<String>,
 }
 
 impl Default for EncodeSettings {
-    /// 30fps・8 Mbps。
+    /// 30fps・8 Mbps・ソフトエンコード（libx264）。
     fn default() -> Self {
-        EncodeSettings { fps: 30, bit_rate: 8_000_000 }
+        EncodeSettings { fps: 30, bit_rate: 8_000_000, encoder: None }
+    }
+}
+
+/// デコード設定。
+pub struct DecodeSettings {
+    /// HW デコードの種類。`None` ならソフトデコード。
+    /// 例: `Some("d3d11va")`（AMD/Windows 汎用）/ `Some("dxva2")`。
+    pub hwaccel: Option<String>,
+}
+
+impl Default for DecodeSettings {
+    /// ソフトデコード。
+    fn default() -> Self {
+        DecodeSettings { hwaccel: None }
     }
 }
 
@@ -146,11 +163,17 @@ impl Pipeline {
 pub struct VideoFile;
 
 impl VideoFile {
-    /// `path` のデコーダを開き、各フレームを RGBA8 化して yield する [`Pipeline`] を作る。
+    /// `path` をソフトデコードで開く（[`DecodeSettings::default`]）。
     ///
     /// 開けなかった場合でも panic せず、フレームを 1 枚も yield しない空のソースになる
     /// （実際のエラーは標準エラー出力に表示され、[`Pipeline::encode_to`] がエラーを返す）。
     pub fn new(path: &str) -> Pipeline {
-        Pipeline { source: decode_iter(path), stages: vec![] }
+        Self::open(path, DecodeSettings::default())
+    }
+
+    /// `path` のデコーダを [`DecodeSettings`] で開き、各フレームを RGBA8 化して yield する
+    /// [`Pipeline`] を作る。HW デコードの選択はここで行う。
+    pub fn open(path: &str, settings: DecodeSettings) -> Pipeline {
+        Pipeline { source: decode_iter(path, settings.hwaccel.as_deref()), stages: vec![] }
     }
 }

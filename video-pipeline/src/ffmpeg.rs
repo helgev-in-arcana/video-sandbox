@@ -4,10 +4,10 @@
 use std::ffi::CString;
 use std::ptr::copy_nonoverlapping;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use rsmpeg::avcodec::{AVCodec, AVCodecContext};
 use rsmpeg::avformat::{AVFormatContextInput, AVFormatContextOutput};
-use rsmpeg::avutil::{ra, AVFrame};
+use rsmpeg::avutil::{ra, AVFrame, AVHWDeviceContext};
 use rsmpeg::error::RsmpegError;
 use rsmpeg::ffi;
 use rsmpeg::swscale::SwsContext;
@@ -28,14 +28,33 @@ fn pack_rgba(plane: *const u8, stride: usize, width: usize, height: usize) -> Ve
     data
 }
 
+/// デコーダのフォーマット選択コールバック。候補に HW フォーマット（D3D11 / DXVA2）が
+/// あればそれを選び、無ければ先頭（ソフト）にフォールバックする。
+unsafe extern "C" fn get_format_hw(
+    _ctx: *mut ffi::AVCodecContext,
+    fmts: *const ffi::AVPixelFormat,
+) -> ffi::AVPixelFormat {
+    unsafe {
+        let first = *fmts;
+        let mut p = fmts;
+        while *p != ffi::AV_PIX_FMT_NONE {
+            if *p == ffi::AV_PIX_FMT_D3D11 || *p == ffi::AV_PIX_FMT_DXVA2_VLD {
+                return *p;
+            }
+            p = p.add(1);
+        }
+        first
+    }
+}
+
 // ---------------------------------------------------------------------------
 // デコード（ソース）
 // ---------------------------------------------------------------------------
 
 /// 入力を開き、各フレームを RGBA8 化して yield する Iterator を返す。
 /// 開けなかった場合は警告を出して空 Iterator を返す（ソースは無謬な Iterator）。
-pub fn decode_iter(path: &str) -> Box<dyn Iterator<Item = Frame> + Send> {
-    match Decoder::open(path) {
+pub fn decode_iter(path: &str, hwaccel: Option<&str>) -> Box<dyn Iterator<Item = Frame> + Send> {
+    match Decoder::open(path, hwaccel) {
         Ok(d) => Box::new(d),
         Err(e) => {
             eprintln!("[video-sandbox] 入力 '{path}' を開けませんでした: {e:#}");
@@ -53,7 +72,7 @@ struct Decoder {
 }
 
 impl Decoder {
-    fn open(path: &str) -> Result<Self> {
+    fn open(path: &str, hwaccel: Option<&str>) -> Result<Self> {
         let path_c = CString::new(path)?;
         let input = AVFormatContextInput::open(&path_c)?;
         let (stream_index, decoder) = input
@@ -64,8 +83,37 @@ impl Decoder {
             let stream = &input.streams()[stream_index];
             decode_ctx.apply_codecpar(&stream.codecpar())?;
         }
+
+        // HW デコードの選択（[`DecodeSettings::hwaccel`]）。例: d3d11va（AMD/Windows 汎用）/ dxva2。
+        // フレームは GPU サーフェスで返るので、next() で hwframe_transfer_data によりシステム
+        // メモリへ落としてから sws→RGBA に流す。
+        if let Some(kind) = hwaccel.filter(|s| !s.is_empty()) {
+            let dev_type = match kind {
+                "d3d11va" => ffi::AV_HWDEVICE_TYPE_D3D11VA,
+                "dxva2" => ffi::AV_HWDEVICE_TYPE_DXVA2,
+                other => bail!("未知の VS_HWDEC: {other}（d3d11va / dxva2 のみ）"),
+            };
+            let hwdev = AVHWDeviceContext::create(dev_type, None, None, 0)?;
+            decode_ctx.set_hw_device_ctx(hwdev);
+            decode_ctx.set_get_format(Some(get_format_hw));
+            eprintln!("[dec] HW デコード: {kind}");
+        }
+
         decode_ctx.open(None)?;
         Ok(Decoder { input, decode_ctx, stream_index, sws: None, flushed: false })
+    }
+
+    /// HW サーフェスなら GPU からシステムメモリへ転送する。ソフトフレームはそのまま返す。
+    fn maybe_download(&self, frame: AVFrame) -> AVFrame {
+        if frame.hw_frames_ctx.is_null() {
+            return frame; // 既にシステムメモリ上（ソフトデコード）
+        }
+        let mut sw = AVFrame::new();
+        sw.hwframe_transfer_data(&frame)
+            .expect("hwframe_transfer_data（GPU→システムメモリ）に失敗");
+        // 転送はピクセルデータのみ。タイムスタンプは引き継がれないので手で写す。
+        sw.set_pts(frame.pts);
+        sw
     }
 
     /// デコード済み AVFrame（YUV 等）を RGBA8 の `Frame` に変換する。
@@ -111,7 +159,10 @@ impl Iterator for Decoder {
     fn next(&mut self) -> Option<Frame> {
         loop {
             match self.decode_ctx.receive_frame() {
-                Ok(frame) => return Some(self.convert(&frame)),
+                Ok(frame) => {
+                    let frame = self.maybe_download(frame);
+                    return Some(self.convert(&frame));
+                }
                 Err(RsmpegError::DecoderDrainError) => {
                     if self.flushed {
                         return None;
@@ -176,8 +227,13 @@ impl Encoder {
         let path_c = CString::new(path)?;
         let mut output = AVFormatContextOutput::create(&path_c)?;
 
-        let encoder = AVCodec::find_encoder(ffi::AV_CODEC_ID_H264)
-            .ok_or_else(|| anyhow!("H.264 エンコーダが見つかりません"))?;
+        // 使用エンコーダ（[`EncodeSettings::encoder`]）。既定は libx264（ソフト）。
+        // 例: h264_amf（AMD HW）/ h264_nvenc / h264_qsv。
+        let enc_name = settings.encoder.as_deref().unwrap_or("libx264");
+        let enc_name_c = CString::new(enc_name)?;
+        let encoder = AVCodec::find_encoder_by_name(&enc_name_c)
+            .ok_or_else(|| anyhow!("エンコーダ '{enc_name}' が見つかりません"))?;
+        eprintln!("[enc] エンコーダ: {enc_name}");
         let mut encode_ctx = AVCodecContext::new(&encoder);
         encode_ctx.set_width(w);
         encode_ctx.set_height(h);
@@ -287,6 +343,10 @@ impl Encoder {
                 Err(e) => return Err(e.into()),
             };
             pkt.set_stream_index(self.stream_index);
+            // 各パケットに 1 フレーム分の duration を持たせる（エンコーダ time_base 単位）。
+            // これが無いと movenc が末尾フレームの長さを決められず discard フラグを立て、
+            // デコード時に 1 枚欠ける。rescale_ts は duration も変換する。
+            pkt.set_duration(1);
             pkt.rescale_ts(self.encode_ctx.time_base, self.stream_time_base);
             self.output.interleaved_write_frame(&mut pkt)?;
         }
