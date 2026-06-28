@@ -62,6 +62,34 @@ impl Frame {
         Frame { width, height, data, ctx }
     }
 
+    /// RGBA8 のバイト列（行優先・パック済み、len = `width * height * 4`）からフレームを構築する。
+    ///
+    /// 画像デコーダ等、フレームワーク外で得た生バイトを取り込むための公開コンストラクタ。
+    ///
+    /// # パニック
+    ///
+    /// `bytes.len()` が `width * height * 4` でないとき。
+    pub fn from_rgba_bytes(width: u32, height: u32, bytes: &[u8], ctx: FrameCtx) -> Self {
+        let count = (width as usize) * (height as usize);
+        assert_eq!(
+            bytes.len(),
+            count * 4,
+            "バイト列の長さ {} が width*height*4 = {} と一致しません",
+            bytes.len(),
+            count * 4
+        );
+        let data = bytemuck::cast_slice(bytes).to_vec();
+        Frame { width, height, data, ctx }
+    }
+
+    /// フレームに付随する文脈を差し替える。
+    ///
+    /// 1 枚の静止フレームから連番の動画を生成する場合など、同じピクセルのまま
+    /// [`FrameCtx`]（フレーム番号・秒数）だけを更新したいときに使う。
+    pub fn set_ctx(&mut self, ctx: FrameCtx) {
+        self.ctx = ctx;
+    }
+
     /// フレーム番号を設定する（デコーダは 0 を埋め、パイプラインが後から確定させる）。
     pub(crate) fn set_index(&mut self, index: u64) {
         self.ctx.index = index;

@@ -1,14 +1,11 @@
-//! パイプラインのビルダーと駆動ループ。
-//!
-//! `VideoFile::new(...).pipe(A).pipe(B).encode_to(...)` の形で組む。ディスパッチは
-//! 動的（`Box<dyn Process>`）。1:1 に確定しているので駆動ループは単なる `fold`。
-//! プール・ping-pong・flush 伝播・Send 境界はいずれも持たない。
-
-use anyhow::{anyhow, bail, Result};
+use anyhow::{bail, Result};
+use std::sync::mpsc::sync_channel;
 
 use crate::ffmpeg::{decode_iter, Encoder};
 use crate::frame::Frame;
 use crate::process::Process;
+
+// ─── エンコード／デコード設定 ────────────────────────────────────────────────
 
 /// 使用する H.264 エンコーダ。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -25,7 +22,6 @@ pub enum VideoEncoder {
 }
 
 impl VideoEncoder {
-    /// `avcodec_find_encoder_by_name` に渡すコーデック名。
     pub(crate) fn codec_name(self) -> &'static str {
         match self {
             VideoEncoder::Software => "libx264",
@@ -53,7 +49,7 @@ pub enum HwAccel {
 
 /// エンコード設定。実験用に必要十分な最小限。
 pub struct EncodeSettings {
-    /// 出力フレームレート（fps）。出力 pts はフレーム番号で振り直す。
+    /// 出力フレームレート（fps）。
     pub fps: i32,
     /// 目標ビットレート（bit/s）。
     pub bit_rate: i64,
@@ -81,108 +77,120 @@ impl Default for DecodeSettings {
     }
 }
 
-/// ソース（フレーム列）と連結された [`Process`] ノード列を保持するビルダー兼実行器。
-///
-/// [`VideoFile::new`] で作り、[`Pipeline::pipe`] / [`Pipeline::map`] で組み立て、
-/// [`Pipeline::encode_to`] で消費する。
-pub struct Pipeline {
-    source: Box<dyn Iterator<Item = Frame> + Send>,
-    stages: Vec<Box<dyn Process>>,
-    /// コンテナが申告する総フレーム数（不明なら `None`）。進捗表示に使う。
-    total_frames: Option<u64>,
-}
+// ─── Pipeline トレイト ───────────────────────────────────────────────────────
 
-impl Pipeline {
-    /// [`Process`] ノードを末尾に連結する。
-    pub fn pipe(mut self, p: impl Process + 'static) -> Self {
-        self.stages.push(Box::new(p));
-        self
+/// フレームの pull 型ストリーム。
+///
+/// [`std::iter::Iterator`] と同じ構造で、アダプタが上流ソースをジェネリクスで所有する。
+/// この設計により複数入力の合成・分岐・スレッド境界を型として自然に表現できる。複数入力を
+/// 合成する Mix ノードは、2 つの `impl Pipeline` を受け取りそれ自身が `Pipeline` を実装する
+/// 形でユーザ側（ノード）に実装できる。
+///
+/// # 使用例
+///
+/// ```no_run
+/// use video_pipeline::{VideoFile, EncodeSettings, Pipeline};
+///
+/// VideoFile::new("a.mp4")
+///     .buffered(4)                         // デコードを別スレッドへ
+///     .pipe(|f, _ctx| f)                   // 処理ノード（恒等）
+///     .encode_to("out.mp4", EncodeSettings::default())?;
+/// # Ok::<(), anyhow::Error>(())
+/// ```
+pub trait Pipeline {
+    /// 次のフレームを取り出す。枯渇したら `None`。
+    fn next_frame(&mut self) -> Option<Frame>;
+
+    /// 総フレーム数のヒント（不明なら `None`。進捗表示用）。
+    fn size_hint(&self) -> Option<u64> {
+        None
     }
 
-    /// ソースを消費し、全ステージを通して `path` に動画として書き出す。
+    /// [`Process`] ノードを 1 段連結する。`Iterator::map` 相当。
+    fn pipe<P: Process>(self, p: P) -> Piped<Self, P>
+    where
+        Self: Sized,
+    {
+        Piped { source: self, process: p }
+    }
+
+    /// 上流をバックグラウンドスレッドに移し、容量 `cap` の有界チャネルで繋ぐ。
     ///
-    /// 3 段パイプライン: **デコード**（専用スレッド）→ **処理**（このスレッド + 内部 rayon）
-    /// → **エンコード**（専用スレッド）を有界チャネルで繋ぎ、ffmpeg の I/O を処理と重ねる。
-    /// 処理段は順序を保った単一消費者なので、状態付きノード（`Feedback` 等）の結果は
-    /// 逐次実行と一致する。エンコーダは最初のフレームの寸法で開かれ、フレームが 1 枚も
-    /// 得られなければエラーを返す。
-    pub fn encode_to(self, path: &str, settings: EncodeSettings) -> Result<()> {
-        use std::io::Write;
-        use std::sync::mpsc::sync_channel;
-        use std::time::{Duration, Instant};
-
-        // 有界チャネルの容量。小さめにしてバックプレッシャーとメモリ上限を効かせる。
-        const CAP: usize = 4;
-
-        let Pipeline { mut source, mut stages, total_frames } = self;
-        let path = path.to_string();
-
-        let (dec_tx, dec_rx) = sync_channel::<Frame>(CAP);
-        let (enc_tx, enc_rx) = sync_channel::<Frame>(CAP);
-
-        // --- デコード専用スレッド: source.next() の結果を流すだけ ---
-        let dec_handle = std::thread::spawn(move || {
-            let mut busy = Duration::ZERO;
-            loop {
-                let t = Instant::now();
-                let frame = source.next();
-                busy += t.elapsed();
-                match frame {
-                    // 送信ブロック（バックプレッシャー）は busy に含めない。
-                    Some(f) => {
-                        if dec_tx.send(f).is_err() {
-                            break; // 下流が落ちた
-                        }
-                    }
-                    None => break,
+    /// デコードや重い処理段を別スレッドに退避して、処理とエンコードをオーバーラップさせる。
+    /// 複数の `.buffered()` を挟むことで 3 段以上のパイプライン並列も組める。
+    fn buffered(self, cap: usize) -> Buffered
+    where
+        Self: Sized + Send + 'static,
+    {
+        let total = self.size_hint();
+        let (tx, rx) = sync_channel(cap);
+        std::thread::spawn(move || {
+            let mut src = self;
+            while let Some(frame) = src.next_frame() {
+                if tx.send(frame).is_err() {
+                    break;
                 }
             }
-            busy
         });
+        Buffered { rx, total }
+    }
 
-        // --- エンコード専用スレッド: 最初のフレームでエンコーダを開き、流れてくる順に書く ---
-        let enc_handle = std::thread::spawn(move || -> Result<(Duration, u64)> {
+    /// `Box<dyn Pipeline>` へ型消去する。型名が長くなりすぎた時の逃げ道。
+    fn boxed(self) -> Box<dyn Pipeline>
+    where
+        Self: Sized + 'static,
+    {
+        Box::new(self)
+    }
+
+    /// ソースを消費し、全フレームを `path` に H.264 動画として書き出す。
+    ///
+    /// エンコードは専用スレッドで並列実行される。上流に `.buffered()` を挟むと
+    /// デコード・処理・エンコードを 3 スレッドで重ねられる。
+    fn encode_to(mut self, path: &str, settings: EncodeSettings) -> Result<()>
+    where
+        Self: Sized,
+    {
+        use std::io::Write;
+
+        let (tx, rx) = sync_channel::<Frame>(4);
+        let path = path.to_string();
+
+        let enc_handle = std::thread::spawn(move || -> Result<u64> {
             let mut enc: Option<Encoder> = None;
-            let mut busy = Duration::ZERO;
-            let mut frames = 0u64;
-            for frame in enc_rx {
+            let mut count = 0u64;
+            for frame in rx {
                 let enc = match &mut enc {
                     Some(e) => e,
                     None => {
                         enc.insert(Encoder::new(&path, frame.width(), frame.height(), &settings)?)
                     }
                 };
-                let t = Instant::now();
                 enc.encode(frame)?;
-                busy += t.elapsed();
-                frames += 1;
+                count += 1;
             }
             match enc {
                 Some(e) => e.finish()?,
                 None => bail!("ソースからフレームが 1 枚も得られませんでした"),
             }
-            Ok((busy, frames))
+            Ok(count)
         });
 
-        // --- 処理段（このスレッド）: デコード結果を順に受け、全ステージを通して送る ---
-        let mut t_process = Duration::ZERO;
+        let total = self.size_hint();
         let mut index = 0u64;
-        for mut frame in dec_rx {
-            frame.set_index(index);
-            let ctx = frame.ctx();
-            let t = Instant::now();
-            let out = stages.iter_mut().fold(frame, |f, s| s.process(f, ctx));
-            t_process += t.elapsed();
-            if enc_tx.send(out).is_err() {
-                break; // エンコードスレッドが落ちた
+        while let Some(frame) = self.next_frame() {
+            if tx.send(frame).is_err() {
+                break;
             }
             index += 1;
-
-            // 進捗表示（同じ行を上書き）。総数が分かれば割合も出す。
             let mut err = std::io::stderr().lock();
-            match total_frames {
+            match total {
                 Some(t) => {
-                    let _ = write!(err, "\r[進捗] {index}/{t} ({:.1}%)", index as f64 / t as f64 * 100.0);
+                    let _ = write!(
+                        err,
+                        "\r[進捗] {index}/{t} ({:.1}%)",
+                        index as f64 / t as f64 * 100.0
+                    );
                 }
                 None => {
                     let _ = write!(err, "\r[進捗] {index} フレーム");
@@ -190,47 +198,92 @@ impl Pipeline {
             }
             let _ = err.flush();
         }
-        eprintln!(); // 進捗行を確定（以降のログを次の行へ）
-        drop(enc_tx); // チャネルを閉じてエンコードスレッドを終了させる
+        eprintln!();
+        drop(tx);
 
-        let t_decode = dec_handle
+        enc_handle
             .join()
-            .map_err(|_| anyhow!("デコードスレッドが panic しました"))?;
-        let (t_encode, frames) = enc_handle
-            .join()
-            .map_err(|_| anyhow!("エンコードスレッドが panic しました"))??;
-
-        eprintln!(
-            "[計測] {frames} フレーム（各段の busy 時間）: \
-             デコード {:.2}s / 処理 {:.2}s / エンコード {:.2}s",
-            t_decode.as_secs_f32(),
-            t_process.as_secs_f32(),
-            t_encode.as_secs_f32(),
-        );
-
-        Ok(())
+            .map_err(|_| anyhow::anyhow!("エンコードスレッドが panic しました"))?
+            .map(|_| ())
     }
 }
 
-/// 動画ファイルソース。
-///
-/// `rsmpeg` は [`VideoFile::new`]（ソース）と [`Pipeline::encode_to`]（シンク）の内部に
-/// 閉じ込められ、中間の [`Process`] は `rsmpeg` に一切依存しない。
+impl Pipeline for Box<dyn Pipeline> {
+    fn next_frame(&mut self) -> Option<Frame> {
+        (**self).next_frame()
+    }
+    fn size_hint(&self) -> Option<u64> {
+        (**self).size_hint()
+    }
+}
+
+// ─── アダプタ構造体 ──────────────────────────────────────────────────────────
+
+/// [`Pipeline::pipe`] で生成される 1 段変換アダプタ。
+pub struct Piped<S, P> {
+    source: S,
+    process: P,
+}
+
+impl<S: Pipeline, P: Process> Pipeline for Piped<S, P> {
+    fn next_frame(&mut self) -> Option<Frame> {
+        let frame = self.source.next_frame()?;
+        let ctx = frame.ctx();
+        Some(self.process.process(frame, ctx))
+    }
+    fn size_hint(&self) -> Option<u64> {
+        self.source.size_hint()
+    }
+}
+
+/// [`Pipeline::buffered`] で生成されるスレッド境界アダプタ。上流はバックグラウンドスレッドで走る。
+pub struct Buffered {
+    rx: std::sync::mpsc::Receiver<Frame>,
+    total: Option<u64>,
+}
+
+impl Pipeline for Buffered {
+    fn next_frame(&mut self) -> Option<Frame> {
+        self.rx.recv().ok()
+    }
+    fn size_hint(&self) -> Option<u64> {
+        self.total
+    }
+}
+
+// ─── デコードソース ──────────────────────────────────────────────────────────
+
+/// 動画ファイルをデコードする [`Pipeline`]。[`VideoFile`] で生成する。
+pub struct Decode {
+    inner: Box<dyn Iterator<Item = Frame> + Send>,
+    total: Option<u64>,
+    index: u64,
+}
+
+impl Pipeline for Decode {
+    fn next_frame(&mut self) -> Option<Frame> {
+        let mut frame = self.inner.next()?;
+        frame.set_index(self.index);
+        self.index += 1;
+        Some(frame)
+    }
+    fn size_hint(&self) -> Option<u64> {
+        self.total
+    }
+}
+
+/// 動画ファイルソース。[`Decode`] を生成するファクトリ。
 pub struct VideoFile;
 
 impl VideoFile {
-    /// `path` をソフトデコードで開く（[`DecodeSettings::default`]）。
-    ///
-    /// 開けなかった場合でも panic せず、フレームを 1 枚も yield しない空のソースになる
-    /// （実際のエラーは標準エラー出力に表示され、[`Pipeline::encode_to`] がエラーを返す）。
-    pub fn new(path: &str) -> Pipeline {
+    /// `path` をソフトデコードで開く。
+    pub fn new(path: &str) -> Decode {
         Self::open(path, DecodeSettings::default())
     }
 
-    /// `path` のデコーダを [`DecodeSettings`] で開き、各フレームを RGBA8 化して yield する
-    /// [`Pipeline`] を作る。HW デコードの選択はここで行う。
-    pub fn open(path: &str, settings: DecodeSettings) -> Pipeline {
-        let (source, total_frames) = decode_iter(path, settings.hwaccel);
-        Pipeline { source, stages: vec![], total_frames }
+    /// `path` を [`DecodeSettings`] で開く。HW デコードはここで選択する。
+    pub fn open(path: &str, settings: DecodeSettings) -> Decode {
+        let (inner, total) = decode_iter(path, settings.hwaccel);
+        Decode { inner, total, index: 0 }
     }
 }
