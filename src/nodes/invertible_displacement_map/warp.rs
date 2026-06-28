@@ -15,7 +15,6 @@ pub struct FloatImage {
 }
 
 impl FloatImage {
-    /// 黒（不透明）で初期化した `w`×`h` の画像を作る。
     fn black(w: usize, h: usize) -> Self {
         Self { w, h, data: vec![[0.0, 0.0, 0.0, 255.0]; w * h] }
     }

@@ -1,8 +1,6 @@
 use rayon::prelude::*;
 use video_pipeline::Frame;
 
-use crate::videogen::{FractalNoiseDescriptor, Perm};
-
 /// 2ch（vx, vy）の変位場。SoA で `vx`/`vy` を別バッファに持つ（スペック §2 推奨）。
 ///
 /// フロー写像 φ を**相対変位形** `φ(x) = x + d(x)` で保持する（絶対座標でなく変位）。squaring も
@@ -15,7 +13,6 @@ pub struct Field {
 }
 
 impl Field {
-    /// ゼロ変位の `w`×`h` 場を作る。
     fn zeros(w: usize, h: usize) -> Self {
         Self { w, h, vx: vec![0.0; w * h], vy: vec![0.0; w * h] }
     }
@@ -49,49 +46,12 @@ impl Field {
     }
 }
 
-/// fBm から 2ch 速度場 `v` を生成する。
-#[allow(clippy::too_many_arguments)]
-///
-/// 単位の規約: 戻り値は **field-grid px** 単位。1× 画像での最大変位目安 `amplitude`(1×-px) に対し
-/// `v = (amplitude / field_divisor) * noise` とする（後段 `upsample_field` で `k*field_divisor` 倍
-/// して k×-px の φ に戻すと、実効変位が `amplitude*k`(k×-px) ＝ 物理的に `amplitude`(1×-px) と一致）。
-/// vx/vy は座標に固定オフセットを足して相関を断つ（[`domain_warp`](crate::videogen::domain_warp) と同手法）。
-pub fn generate_velocity(
-    perm: &Perm,
-    desc: &FractalNoiseDescriptor,
-    w: usize,
-    h: usize,
-    field_divisor: f32,
-    feature_scale: f32,
-    amplitude: f32,
-    z: f32,
-) -> Field {
-    let mut field = Field::zeros(w, h);
-    let amp = amplitude / field_divisor;
-    let inv_scale = field_divisor / feature_scale; // field 格子→ノイズ座標
-    field
-        .vx
-        .par_chunks_mut(w)
-        .zip(field.vy.par_chunks_mut(w))
-        .enumerate()
-        .for_each(|(y, (vx_row, vy_row))| {
-            let ny = y as f32 * inv_scale;
-            for x in 0..w {
-                let nx = x as f32 * inv_scale;
-                vx_row[x] = amp * desc.sample(perm, nx, ny, z);
-                // vy は去相関のため座標を大きくずらす。
-                vy_row[x] = amp * desc.sample(perm, nx + 31.7, ny + 11.3, z + 5.1);
-            }
-        });
-    field
-}
-
 /// 外部マップフレームの **R→vx, G→vy** チャンネルから 2ch 速度場 `v` を生成する。
 ///
-/// [`Displace`](crate::nodes::Displace) と同じ正規化（`0..=255` → `-1..=1`、128 が変位ゼロ）で読み、
-/// `amplitude`(1×-px) を掛ける。単位は [`generate_velocity`] と揃えて **field-grid px**
-/// （`amplitude / field_divisor`）。`map` のサイズが field 解像度と違っても比例座標で最近傍
-/// サンプルするので任意サイズのマップを受け付ける。`feature_scale`/`seed`/`time_scale` は無関係。
+/// `0..=255` → `-1..=1`（128 が変位ゼロ）で正規化し `amplitude`(1×-px) を掛ける。
+/// 戻り値は **field-grid px** 単位（`amplitude / field_divisor`）。後段 [`upsample_field`] で
+/// `k * field_divisor` 倍して k×-px にすると実効変位 = `amplitude`(1×-px) と一致する。
+/// `map` のサイズが field 解像度と違っても比例最近傍サンプルするので任意サイズを受け付ける。
 pub fn velocity_from_map(
     map: &Frame,
     w: usize,
@@ -108,7 +68,6 @@ pub fn velocity_from_map(
         .zip(field.vy.par_chunks_mut(w))
         .enumerate()
         .for_each(|(y, (vx_row, vy_row))| {
-            // field 格子 → map 画素へ比例対応（最近傍）。
             let my = ((y as u32 * mh) / h.max(1) as u32).min(mh - 1);
             for x in 0..w {
                 let mx = ((x as u32 * mw) / w.max(1) as u32).min(mw - 1);
@@ -170,7 +129,6 @@ pub fn upsample_field(field: &Field, out_w: usize, out_h: usize, vec_scale: f32)
         .zip(out.vy.par_chunks_mut(out_w))
         .enumerate()
         .for_each(|(y, (vx_row, vy_row))| {
-            // ピクセル中心対応で元グリッド座標へ写す。
             let fy = (y as f32 + 0.5) * sy - 0.5;
             for x in 0..out_w {
                 let fx = (x as f32 + 0.5) * sx - 0.5;
@@ -182,10 +140,7 @@ pub fn upsample_field(field: &Field, out_w: usize, out_h: usize, vec_scale: f32)
     out
 }
 
-/// `det(I + ∇d)` の最小値を内部格子点（中心差分）で返す。
-///
-/// 全点で正なら写像に折りたたみが無い（幾何的可逆性 (1) の検証用）。SVF 積分済みの φ なら
-/// 構造的に正になるはず。
+/// `det(I + ∇d)` の最小値を内部格子点（中心差分）で返す（折りたたみ検証用）。
 #[cfg(test)]
 pub fn min_det_jacobian(field: &Field) -> f32 {
     let (w, h) = (field.w, field.h);
@@ -205,7 +160,6 @@ pub fn min_det_jacobian(field: &Field) -> f32 {
                 let (_, vyxm) = field.at(x - 1, y);
                 let (vxyp, _) = field.at(x, y + 1);
                 let (vxym, _) = field.at(x, y - 1);
-                // 中心差分（格子間隔 1）。
                 let dvx_dx = (xp - xm) * 0.5;
                 let dvy_dy = (yp - ym) * 0.5;
                 let dvy_dx = (vyxp - vyxm) * 0.5;
@@ -216,4 +170,38 @@ pub fn min_det_jacobian(field: &Field) -> f32 {
             local
         })
         .reduce(|| f32::INFINITY, f32::min)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use video_pipeline::{Frame, FrameCtx, Pixel};
+
+    fn ctx() -> FrameCtx {
+        FrameCtx { index: 0, pts: 0, seconds: 0.0 }
+    }
+
+    fn sinusoidal_map(w: u32, h: u32) -> Frame {
+        let mut f = Frame::black(w, h, ctx());
+        f.per_iter_row(&ctx(), |_c, y, row| {
+            for (x, px) in row.iter_mut().enumerate() {
+                let u = x as f32 / w as f32 * std::f32::consts::TAU;
+                let v = y as f32 / h as f32 * std::f32::consts::TAU;
+                let r = ((u.sin() * 0.5 + 0.5) * 255.0) as u8;
+                let g = ((v.cos() * 0.5 + 0.5) * 255.0) as u8;
+                *px = Pixel::rgb(r, g, 128);
+            }
+        });
+        f
+    }
+
+    /// SVF 積分済みの φ は全点で折りたたみ無し（det(I+∇d) > 0）。
+    #[test]
+    fn no_folding() {
+        let map = sinusoidal_map(64, 64);
+        let v = velocity_from_map(&map, 64, 64, 1.0, 20.0);
+        let phi = integrate_svf(&v, 6);
+        let min_det = min_det_jacobian(&phi);
+        assert!(min_det > 0.0, "折りたたみが発生: min det = {min_det}");
+    }
 }
