@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use video_pipeline::{Frame, FrameCtx, Pipeline, Pixel};
 
-use super::noise::{fbm, NoiseKind, Perm};
+use super::noise::{FractalKind, FractalNoiseDescriptor, NoiseKind, Perm};
 
 /// 時間方向の扱い方。第3軸 `z`（時間）の進め方を切り替える。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -18,10 +18,12 @@ pub enum TimeMode {
 /// 512 と揃わない値にする（格子点にも乗らないので各フレームが完全に独立になる）。
 const PER_FRAME_GAP: f32 = 101.137;
 
-/// fBm フラクタルノイズを各フレームに描く、ゼロから映像を生成する [`Pipeline`] ソース。
+/// フラクタルノイズを各フレームに描く、ゼロから映像を生成する [`Pipeline`] ソース。
 ///
-/// 3 次元（x, y, 時間）の格子ノイズを [`NoiseKind`] から選び、[`TimeMode`] で時間方向の
-/// 連続／非連続を切り替えられる。出力は既定でグレースケール（fBm 値を RGB に複製）で、
+/// 3 次元（x, y, 時間）のノイズを [`FractalNoiseDescriptor`] で設定する。基底ノイズを
+/// [`NoiseKind`]（Value/Perlin/Simplex/Cellular）から、フラクタル合成を
+/// [`FractalKind`]（fBm/Billow/Ridged/DomainWarp）から選べる。[`TimeMode`] で時間方向の
+/// 連続／非連続を切り替えられる。出力は既定でグレースケール（ノイズ値を RGB に複製）で、
 /// [`with_color`](Self::with_color) で任意の色マッピングに差し替えられる。
 ///
 /// [`StillVideo`](crate::videogen::StillVideo) と同じく `index` を進めながらフレームを発行し、
@@ -48,14 +50,9 @@ pub struct FractalNoise {
     width: u32,
     height: u32,
     frames: u64,
-    kind: NoiseKind,
+    /// 基底ノイズ・フラクタル合成方式・オクターブパラメータ一式。
+    desc: FractalNoiseDescriptor,
     time_mode: TimeMode,
-    /// fBm のオクターブ数。
-    octaves: u32,
-    /// オクターブごとの周波数倍率。
-    lacunarity: f32,
-    /// オクターブごとの振幅倍率（persistence）。
-    gain: f32,
     /// 特徴サイズ（px）。大きいほど模様が粗くなる。
     scale: f32,
     /// Continuous 時の時間進行速度（秒あたりの z 進み）。
@@ -75,18 +72,15 @@ pub struct FractalNoise {
 impl FractalNoise {
     /// `width`×`height` のフレームを `frames` 枚生成するソースを構築する。
     ///
-    /// 既定: Perlin・時間連続・octaves=5・lacunarity=2.0・gain=0.5・scale=64px・
+    /// 既定: Perlin・fBm・時間連続・octaves=5・lacunarity=2.0・gain=0.5・scale=64px・
     /// time_scale=1.0・fps=30・seed=0・グレースケール。
     pub fn new(width: u32, height: u32, frames: u64) -> Self {
         Self {
             width,
             height,
             frames,
-            kind: NoiseKind::Perlin,
+            desc: FractalNoiseDescriptor::new(),
             time_mode: TimeMode::Continuous,
-            octaves: 5,
-            lacunarity: 2.0,
-            gain: 0.5,
             scale: 64.0,
             time_scale: 1.0,
             fps: 30.0,
@@ -97,9 +91,22 @@ impl FractalNoise {
         }
     }
 
-    /// 基本ノイズの種類を選ぶ。
+    /// 基底ノイズ・フラクタル合成方式・オクターブを一括設定する
+    /// [`FractalNoiseDescriptor`] をまるごと差し替える。
+    pub fn descriptor(mut self, desc: FractalNoiseDescriptor) -> Self {
+        self.desc = desc;
+        self
+    }
+
+    /// 基底ノイズの種類を選ぶ（[`FractalNoiseDescriptor::noise`] を更新）。
     pub fn kind(mut self, kind: NoiseKind) -> Self {
-        self.kind = kind;
+        self.desc.noise = kind;
+        self
+    }
+
+    /// フラクタル合成方式を選ぶ（[`FractalNoiseDescriptor::fractal`] を更新）。
+    pub fn fractal(mut self, fractal: FractalKind) -> Self {
+        self.desc.fractal = fractal;
         self
     }
 
@@ -109,21 +116,21 @@ impl FractalNoise {
         self
     }
 
-    /// fBm のオクターブ数を設定する。
+    /// フラクタルのオクターブ数を設定する。
     pub fn octaves(mut self, n: u32) -> Self {
-        self.octaves = n;
+        self.desc.octaves = n;
         self
     }
 
     /// オクターブごとの周波数倍率を設定する。
     pub fn lacunarity(mut self, l: f32) -> Self {
-        self.lacunarity = l;
+        self.desc.lacunarity = l;
         self
     }
 
     /// オクターブごとの振幅倍率（persistence）を設定する。
     pub fn gain(mut self, g: f32) -> Self {
-        self.gain = g;
+        self.desc.gain = g;
         self
     }
 
@@ -183,15 +190,14 @@ impl Pipeline for FractalNoise {
 
         let mut frame = Frame::black(self.width, self.height, ctx);
         // クロージャに渡すため借用をローカルへ。
-        let (perm, kind, scale) = (&*self.perm, self.kind, self.scale);
-        let (octaves, lacunarity, gain) = (self.octaves, self.lacunarity, self.gain);
+        let (perm, desc, scale) = (&*self.perm, self.desc, self.scale);
         let color = self.color.as_deref();
 
         frame.per_iter_row(&ctx, |_ctx, y, row| {
             let ny = y as f32 / scale;
             for (x, px) in row.iter_mut().enumerate() {
                 let nx = x as f32 / scale;
-                let v = fbm(perm, kind, nx, ny, z, octaves, lacunarity, gain);
+                let v = desc.sample(perm, nx, ny, z);
                 *px = match color {
                     Some(f) => f(v),
                     None => gray(v),
