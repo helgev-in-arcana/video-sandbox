@@ -45,7 +45,7 @@ impl Mixer for PerPixelMix {
         let min_width = frames.iter().map(|f| f.width()).min().unwrap_or(0);
         let min_height = frames.iter().map(|f| f.height()).min().unwrap_or(0);
 
-        let mut canvas = Frame::black(min_height, min_height, ctx.pts);
+        let mut canvas = Frame::black(min_height, min_height, ctx);
 
         for y in 0..min_height {
             for x in 0..min_width {

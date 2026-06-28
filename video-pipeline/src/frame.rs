@@ -18,8 +18,8 @@ pub struct Frame {
     height: u32,
     /// 行優先のピクセル列。`data[y * width + x]` でアクセスする。
     data: Vec<Pixel>,
-    /// `rsmpeg` から引き継ぐ presentation timestamp（入力ストリームの time_base 基準）。
-    pts: i64,
+    /// フレームに付随する文脈（タイムスタンプ・秒数・フレーム番号）。
+    ctx: FrameCtx,
 }
 
 impl Frame {
@@ -33,9 +33,9 @@ impl Frame {
         self.height
     }
 
-    /// presentation timestamp（入力ストリームの time_base 基準）。
-    pub fn pts(&self) -> i64 {
-        self.pts
+    /// フレームに付随する文脈（タイムスタンプ・秒数・フレーム番号）。
+    pub fn ctx(&self) -> FrameCtx {
+        self.ctx
     }
 
     /// 内部バッファを RGBA8 のバイト列として借りる（I/O 境界向け）。
@@ -51,15 +51,20 @@ impl Frame {
     /// 既存のピクセル列からフレームを構築する。
     ///
     /// `data` は行優先で len = `width * height` でなければならない。
-    pub(crate) fn from_rgba(width: u32, height: u32, data: Vec<Pixel>, pts: i64) -> Self {
+    pub(crate) fn from_rgba(width: u32, height: u32, data: Vec<Pixel>, ctx: FrameCtx) -> Self {
         debug_assert_eq!(data.len(), (width as usize) * (height as usize));
-        Frame { width, height, data, pts }
+        Frame { width, height, data, ctx }
     }
 
     /// 指定サイズの黒（RGB=0, alpha=255）フレームを確保する。
-    pub fn black(width: u32, height: u32, pts: i64) -> Self {
+    pub fn black(width: u32, height: u32, ctx: FrameCtx) -> Self {
         let data = vec![Pixel::BLACK; (width as usize) * (height as usize)];
-        Frame { width, height, data, pts }
+        Frame { width, height, data, ctx }
+    }
+
+    /// フレーム番号を設定する（デコーダは 0 を埋め、パイプラインが後から確定させる）。
+    pub(crate) fn set_index(&mut self, index: u64) {
+        self.ctx.index = index;
     }
 
     /// `(x, y)` のピクセル添字。範囲外はデバッグビルドで panic。
@@ -123,7 +128,7 @@ impl Frame {
         });
 
         // 転置後は幅と高さが入れ替わる。
-        Frame { width: self.height, height: self.width, data, pts: self.pts }
+        Frame { width: self.height, height: self.width, data, ctx: self.ctx }
     }
 
     /// 各行（x 軸方向に連続するピクセル列）を並列に走査し、行ごとに `f` を適用する。
@@ -156,7 +161,8 @@ mod tests {
     #[test]
     fn transposed_matches_definition() {
         let (w, h) = (37u32, 53u32);
-        let mut f = Frame::black(w, h, 7);
+        let ctx = FrameCtx { index: 0, pts: 7, seconds: 0.7 };
+        let mut f = Frame::black(w, h, ctx);
         for y in 0..h {
             for x in 0..w {
                 f.set_pixel(x, y, Pixel::new(x as u8, y as u8, (x ^ y) as u8, 255));
@@ -165,7 +171,7 @@ mod tests {
         let t = f.transposed();
         assert_eq!(t.width(), h);
         assert_eq!(t.height(), w);
-        assert_eq!(t.pts(), f.pts());
+        assert_eq!(t.ctx().pts, f.ctx().pts);
         for y in 0..h {
             for x in 0..w {
                 // 転置: T.get_pixel(y, x) == F.get_pixel(x, y)
@@ -180,6 +186,8 @@ mod tests {
 pub struct FrameCtx {
     /// 0 始まりのフレーム番号（ソースから取り出した順）。
     pub index: u64,
-    /// presentation timestamp（入力ストリームの time_base 基準）。[`Frame::pts`] と同値。
+    /// presentation timestamp（入力ストリームの time_base 基準）。
     pub pts: i64,
+    /// 動画先頭からの経過時間（秒）。`pts * time_base` で算出。
+    pub seconds: f32,
 }

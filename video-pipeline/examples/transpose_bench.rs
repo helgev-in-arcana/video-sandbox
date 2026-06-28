@@ -3,12 +3,12 @@
 
 use std::hint::black_box;
 use std::time::Instant;
-use video_pipeline::Frame;
+use video_pipeline::{Frame, FrameCtx};
 
 fn main() {
     let w = 1920u32;
     let h = 1080u32;
-    let f = Frame::black(w, h, 0);
+    let f = Frame::black(w, h, FrameCtx { index: 0, pts: 0, seconds: 0.0 });
     let iters = 200u32;
 
     // ウォームアップ。

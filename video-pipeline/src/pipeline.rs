@@ -7,7 +7,7 @@
 use anyhow::{anyhow, bail, Result};
 
 use crate::ffmpeg::{decode_iter, Encoder};
-use crate::frame::{Frame, FrameCtx};
+use crate::frame::Frame;
 use crate::process::Process;
 
 /// 使用する H.264 エンコーダ。
@@ -167,8 +167,9 @@ impl Pipeline {
         // --- 処理段（このスレッド）: デコード結果を順に受け、全ステージを通して送る ---
         let mut t_process = Duration::ZERO;
         let mut index = 0u64;
-        for frame in dec_rx {
-            let ctx = FrameCtx { index, pts: frame.pts() };
+        for mut frame in dec_rx {
+            frame.set_index(index);
+            let ctx = frame.ctx();
             let t = Instant::now();
             let out = stages.iter_mut().fold(frame, |f, s| s.process(f, ctx));
             t_process += t.elapsed();

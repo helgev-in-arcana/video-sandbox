@@ -12,7 +12,7 @@ use rsmpeg::error::RsmpegError;
 use rsmpeg::ffi;
 use rsmpeg::swscale::SwsContext;
 
-use crate::frame::Frame;
+use crate::frame::{Frame, FrameCtx};
 use crate::pipeline::HwAccel;
 use crate::pixel::Pixel;
 
@@ -82,6 +82,8 @@ struct Decoder {
     flushed: bool,
     /// コンテナが申告する総フレーム数（不明なら `None`）。進捗表示に使う。
     total: Option<u64>,
+    /// ビデオストリームの time_base。`pts` から秒数への変換に使う。
+    time_base: ffi::AVRational,
 }
 
 impl Decoder {
@@ -92,11 +94,11 @@ impl Decoder {
             .find_best_stream(ffi::AVMEDIA_TYPE_VIDEO)?
             .ok_or_else(|| anyhow!("動画ストリームが見つかりません"))?;
         let mut decode_ctx = AVCodecContext::new(&decoder);
-        let total = {
+        let (total, time_base) = {
             let stream = &input.streams()[stream_index];
             decode_ctx.apply_codecpar(&stream.codecpar())?;
-            // nb_frames は 0 / 不明のことがある。その場合は None。
-            (stream.nb_frames > 0).then_some(stream.nb_frames as u64)
+            let total = (stream.nb_frames > 0).then_some(stream.nb_frames as u64);
+            (total, stream.time_base)
         };
 
         // HW デコードの選択（[`DecodeSettings::hwaccel`]）。フレームは GPU サーフェスで返るので、
@@ -116,7 +118,7 @@ impl Decoder {
         }
 
         decode_ctx.open(None)?;
-        Ok(Decoder { input, decode_ctx, stream_index, sws: None, flushed: false, total })
+        Ok(Decoder { input, decode_ctx, stream_index, sws: None, flushed: false, total, time_base })
     }
 
     /// HW サーフェスなら GPU からシステムメモリへ転送する。ソフトフレームはそのまま返す。
@@ -165,7 +167,10 @@ impl Decoder {
             .expect("sws_scale (decode) 失敗");
 
         let data = pack_rgba(dst.data[0], dst.linesize[0] as usize, w as usize, h as usize);
-        Frame::from_rgba(w as u32, h as u32, data, src.pts)
+        let tb = self.time_base;
+        let seconds = src.pts as f32 * tb.num as f32 / tb.den as f32;
+        let ctx = FrameCtx { index: 0, pts: src.pts, seconds };
+        Frame::from_rgba(w as u32, h as u32, data, ctx)
     }
 }
 
