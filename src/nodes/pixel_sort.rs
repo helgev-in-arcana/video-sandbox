@@ -10,7 +10,7 @@ pub struct PixelSort {
 
 impl Process for PixelSort {
     fn process(&mut self, mut frame: Frame, ctx: FrameCtx) -> Frame {
-        frame.per_iter_row(&ctx, |ctx, y, row| {
+        frame.per_iter_row(&ctx, |_ctx, _y, row| {
             let mut sort_start = 0;
             let mut sort_end = 0;
 

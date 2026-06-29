@@ -1,4 +1,4 @@
-use video_pipeline::{Frame, FrameCtx, Pipeline, Pixel};
+use video_pipeline::{Frame, FrameCtx, Pipeline, Pixel, Process};
 
 /// 複数フレームを 1 枚に合成するノード。[`Mix`] が 2 入力を受けて呼び出す。
 pub trait Mixer {
@@ -12,51 +12,25 @@ impl<F: FnMut(Vec<Frame>, FrameCtx) -> Frame> Mixer for F {
     }
 }
 
-/// 2 つの上流 [`Pipeline`] を [`Mixer`] で合成し、それ自身も [`Pipeline`] となるノード。
-///
-/// どちらかの上流が枯渇した時点でストリームが終わる（`Iterator::zip` 相当）。各上流を
-/// 独立に `.buffered()` しておけば、2 本のデコードを別スレッドで重ねられる。
-///
-/// # 使用例
-///
-/// ```no_run
-/// use video_pipeline::{VideoFile, EncodeSettings, Pipeline};
-/// use video_sandbox::nodes::{Mix, PerPixelMix};
-///
-/// Mix::new(
-///     VideoFile::new("a.mp4").buffered(4),
-///     VideoFile::new("b.mp4").buffered(4),
-///     PerPixelMix::new_blend(&[0.5, 0.5]),
-/// )
-/// .encode_to("out.mp4", EncodeSettings::default())?;
-/// # Ok::<(), anyhow::Error>(())
-/// ```
-pub struct Mix<A, B, M> {
-    a: A,
-    b: B,
+pub struct Mix<P: Pipeline, M: Mixer> {
+    p: P,
     mixer: M,
 }
 
-impl<A: Pipeline, B: Pipeline, M: Mixer> Mix<A, B, M> {
+impl<P: Pipeline, M: Mixer> Mix<P, M> {
     /// 2 つの上流ソースと合成器から Mix ノードを構築する。
-    pub fn new(a: A, b: B, mixer: M) -> Self {
-        Self { a, b, mixer }
+    pub fn new(p: P, mixer: M) -> Self {
+        Self { p, mixer }
     }
 }
 
-impl<A: Pipeline, B: Pipeline, M: Mixer> Pipeline for Mix<A, B, M> {
-    fn next_frame(&mut self) -> Option<Frame> {
-        let fa = self.a.next_frame()?;
-        let fb = self.b.next_frame()?;
-        let ctx = fa.ctx();
-        Some(self.mixer.mix(vec![fa, fb], ctx))
-    }
-
-    fn size_hint(&self) -> Option<u64> {
-        match (self.a.size_hint(), self.b.size_hint()) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (Some(a), None) | (None, Some(a)) => Some(a),
-            (None, None) => None,
+impl<P: Pipeline, M: Mixer> Process for Mix<P, M> {
+    fn process(&mut self, frame: Frame, ctx: FrameCtx) -> Frame {
+        let b = self.p.next_frame();
+        if let Some(b) = b {
+            self.mixer.mix(vec![frame, b], ctx)
+        } else {
+            frame
         }
     }
 }

@@ -1,22 +1,26 @@
-//! 外部マップ駆動の可逆ディスプレイスメントノード（2 入力 [`Pipeline`]）。
+//! 外部マップ駆動の可逆ディスプレイスメントノード（map 駆動の [`Process`]）。
 //!
-//! **`source`（ずらされる側）と `map`（変位を与える側）** の 2 つの上流 [`Pipeline`] を受け取り、
-//! `map` の **R→vx, G→vy** チャンネル（128 = 変位ゼロ）を速度場として読む。
+//! **主入力（ずらされるフレーム）を [`Process::process`] で受け、副入力 `map`（変位を与える
+//! ストリーム）を内部に [`Pipeline`] として所有して毎フレーム `next_frame()` で引く。** `map` の
+//! **R→vx, G→vy** チャンネル（128 = 変位ゼロ）を速度場として読む。
 //!
 //! その速度場を SVF 積分してから **順ワープ(φ⁻¹) → 内側 [`Process`] → 逆ワープ(φ)** を適用する。
 //! SVF（定常速度場の time-1 フロー）を使うため写像 φ は構造的に折りたたみ無し（微分同相）で、
 //! 逆写像は速度場 `v` の符号反転 `exp(-v)` だけで得られ、順・逆ワープが定義上整合する。
 //!
-//! フラクタルノイズを速度場に使いたい場合は [`FractalNoise`](crate::videogen::FractalNoise) を
-//! `map` として渡す。アルゴリズムの詳細は `svf_invertible_displacement_spec.md` を参照。
+//! [`Process`] なので `source.pipe(InvertibleDisplacementMap::new(map, desc, inner))` で連結し、
+//! [`Feedback`](crate::nodes::Feedback) / [`LowResGlitch`](crate::nodes::LowResGlitch) の内側
+//! [`Process`] にも差し込める。フラクタルノイズを速度場に使いたい場合は
+//! [`FractalNoise`](crate::videogen::FractalNoise) を `map` として渡す。アルゴリズムの詳細は
+//! `svf_invertible_displacement_spec.md` を参照。
 
 pub(crate) mod field;
 pub(crate) mod warp;
 
 use video_pipeline::{Frame, FrameCtx, Pipeline, Process};
 
-use field::{integrate_svf, pad_field_clamp, upsample_field, velocity_from_map, Field};
-use warp::{downsample_image, upsample_image, warp_image, FloatImage};
+use field::{Field, integrate_svf, pad_field_clamp, upsample_field, velocity_from_map};
+use warp::{FloatImage, downsample_image, upsample_image, warp_image};
 
 /// ワープの方向。順ワープ(φ⁻¹) と 逆ワープ(φ) のどちらを適用するか。
 ///
@@ -168,15 +172,18 @@ impl DisplacementDescriptor {
 
     /// 実際に使うパディング量（1×-px）。`None` は `amplitude` 切り上げに解決する。
     fn resolved_padding(&self) -> u32 {
-        self.padding.unwrap_or_else(|| self.amplitude.max(0.0).ceil() as u32)
+        self.padding
+            .unwrap_or_else(|| self.amplitude.max(0.0).ceil() as u32)
     }
 }
 
-/// `source` と `map` の 2 上流を受け、`map` を速度場として `source` を可逆ワープする 2 入力ノード。
+/// 主入力フレームを、副入力 `map` を速度場として可逆ワープする map 駆動の [`Process`]。
 ///
 /// `map` は **R→X, G→Y**（`128` が変位ゼロ）として解釈し、[`DisplacementDescriptor::amplitude`] を
 /// 掛けて速度場にする。内側 `()` を渡せば純粋なラウンドトリップ（≈ 恒等）になる。
-/// どちらかの上流が枯渇した時点でストリームが終わる。
+///
+/// `map` が主入力より先に枯渇したら、**直近に取れた map フレームを据え置いて**使い続ける（毎フレーム
+/// のコピーは無し。所有フレームを参照するだけ）。一度も map が来ない場合のみ主入力を素通しする。
 ///
 /// # 使用例
 ///
@@ -186,26 +193,28 @@ impl DisplacementDescriptor {
 /// use video_sandbox::videogen::FractalNoise;
 ///
 /// // フラクタルノイズをマップに、歪んだ空間で色反転してから引き戻す。
-/// InvertibleDisplacementMap::new(
-///     VideoFile::new("source.mp4").buffered(4),
-///     FractalNoise::new(1920, 1080, 300).buffered(4),
-///     DisplacementDescriptor::new().amplitude(40.0),
-///     Invert,
-/// )
-/// .encode_to("out.mp4", EncodeSettings::default())?;
+/// VideoFile::new("source.mp4")
+///     .buffered(4)
+///     .pipe(InvertibleDisplacementMap::new(
+///         FractalNoise::new(1920, 1080, 300).buffered(4),
+///         DisplacementDescriptor::new().amplitude(40.0),
+///         Invert,
+///     ))
+///     .encode_to("out.mp4", EncodeSettings::default())?;
 /// # Ok::<(), anyhow::Error>(())
 /// ```
-pub struct InvertibleDisplacementMap<S, M, P> {
-    source: S,
+pub struct InvertibleDisplacementMap<M, P> {
     map: M,
+    /// 直近に取れた map フレーム（枯渇後はこれを据え置いて使う）。
+    last_map: Option<Frame>,
     desc: DisplacementDescriptor,
     inner: P,
 }
 
-impl<S: Pipeline, M: Pipeline, P: Process> InvertibleDisplacementMap<S, M, P> {
-    /// `source`・`map`・ディスクリプタ・内側 [`Process`] からノードを構築する。
-    pub fn new(source: S, map: M, desc: DisplacementDescriptor, inner: P) -> Self {
-        Self { source, map, desc, inner }
+impl<M: Pipeline, P: Process> InvertibleDisplacementMap<M, P> {
+    /// `map`・ディスクリプタ・内側 [`Process`] からノードを構築する。
+    pub fn new(map: M, desc: DisplacementDescriptor, inner: P) -> Self {
+        Self { map, last_map: None, desc, inner }
     }
 
     /// ディスクリプタを差し替える。
@@ -221,30 +230,25 @@ impl<S: Pipeline, M: Pipeline, P: Process> InvertibleDisplacementMap<S, M, P> {
     }
 }
 
-impl<S: Pipeline, M: Pipeline, P: Process> Pipeline for InvertibleDisplacementMap<S, M, P> {
-    fn next_frame(&mut self) -> Option<Frame> {
-        let source = self.source.next_frame()?;
-        let map = self.map.next_frame()?;
-        let ctx = source.ctx();
+impl<M: Pipeline, P: Process> Process for InvertibleDisplacementMap<M, P> {
+    fn process(&mut self, frame: Frame, ctx: FrameCtx) -> Frame {
+        // map が生きていれば前進、尽きていれば直近フレームを据え置く（ムーブのみ、コピー無し）。
+        if let Some(m) = self.map.next_frame() {
+            self.last_map = Some(m);
+        }
+        let Some(map) = &self.last_map else {
+            return frame; // 一度も map が来ていない時だけ素通し。
+        };
 
-        let (w, h) = (source.width() as usize, source.height() as usize);
+        let (w, h) = (frame.width() as usize, frame.height() as usize);
         if w == 0 || h == 0 {
-            return Some(source);
+            return frame;
         }
         let div = self.desc.field_divisor.max(1) as usize;
         let fw = (w / div).max(1);
         let fh = (h / div).max(1);
-
-        let v = velocity_from_map(&map, fw, fh, div as f32, self.desc.amplitude);
-        Some(warp_with_field(&self.desc, &mut self.inner, &source, v, ctx))
-    }
-
-    fn size_hint(&self) -> Option<u64> {
-        match (self.source.size_hint(), self.map.size_hint()) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (Some(a), None) | (None, Some(a)) => Some(a),
-            (None, None) => None,
-        }
+        let v = velocity_from_map(map, fw, fh, div as f32, self.desc.amplitude);
+        warp_with_field(&self.desc, &mut self.inner, &frame, v, ctx)
     }
 }
 
@@ -335,7 +339,11 @@ mod tests {
     use video_pipeline::{Frame, FrameCtx, Pixel};
 
     fn ctx() -> FrameCtx {
-        FrameCtx { index: 0, pts: 0, seconds: 0.0 }
+        FrameCtx {
+            index: 0,
+            pts: 0,
+            seconds: 0.0,
+        }
     }
 
     struct Once(Option<Frame>);
@@ -343,6 +351,21 @@ mod tests {
         fn next_frame(&mut self) -> Option<Frame> {
             self.0.take()
         }
+    }
+
+    struct Empty;
+    impl Pipeline for Empty {
+        fn next_frame(&mut self) -> Option<Frame> {
+            None
+        }
+    }
+
+    fn frames_equal(a: &Frame, b: &Frame) -> bool {
+        if (a.width(), a.height()) != (b.width(), b.height()) {
+            return false;
+        }
+        (0..a.height())
+            .all(|y| (0..a.width()).all(|x| a.get_pixel(x, y) == b.get_pixel(x, y)))
     }
 
     fn pattern(w: u32, h: u32) -> Frame {
@@ -411,13 +434,8 @@ mod tests {
 
     fn run(desc: DisplacementDescriptor) -> (Frame, Frame) {
         let input = pattern(80, 80);
-        let mut node = InvertibleDisplacementMap::new(
-            Once(Some(input.clone())),
-            Once(Some(velocity_map(80, 80))),
-            desc,
-            (),
-        );
-        let out = node.next_frame().unwrap();
+        let mut node = InvertibleDisplacementMap::new(Once(Some(velocity_map(80, 80))), desc, ());
+        let out = node.process(input.clone(), ctx());
         (input, out)
     }
 
@@ -451,25 +469,23 @@ mod tests {
     fn forward_then_inverse_recovers() {
         let input = pattern(80, 80);
         let map = velocity_map(80, 80);
-        let desc = DisplacementDescriptor::new().amplitude(6.0).squaring_steps(4);
+        let desc = DisplacementDescriptor::new()
+            .amplitude(6.0)
+            .squaring_steps(4);
 
-        let fwd = InvertibleDisplacementMap::new(
-            Once(Some(input.clone())),
+        let mut fwd_node = InvertibleDisplacementMap::new(
             Once(Some(map.clone())),
             desc.warp_mode(WarpMode::ForwardOnly),
             (),
-        )
-        .next_frame()
-        .unwrap();
+        );
+        let fwd = fwd_node.process(input.clone(), ctx());
 
-        let back = InvertibleDisplacementMap::new(
-            Once(Some(fwd)),
+        let mut back_node = InvertibleDisplacementMap::new(
             Once(Some(map)),
             desc.warp_mode(WarpMode::InverseOnly),
             (),
-        )
-        .next_frame()
-        .unwrap();
+        );
+        let back = back_node.process(fwd, ctx());
 
         let err = interior_mean_abs_diff(&input, &back, 16);
         assert!(err < 10.0, "分割ラウンドトリップ誤差が大きい: {err}");
@@ -497,15 +513,12 @@ mod tests {
                 });
                 f
             };
-            let desc =
-                DisplacementDescriptor::new().amplitude(14.0).squaring_steps(5).supersample(k);
-            let mut node = InvertibleDisplacementMap::new(
-                Once(Some(input.clone())),
-                Once(Some(map)),
-                desc,
-                (),
-            );
-            let out = node.next_frame().unwrap();
+            let desc = DisplacementDescriptor::new()
+                .amplitude(14.0)
+                .squaring_steps(5)
+                .supersample(k);
+            let mut node = InvertibleDisplacementMap::new(Once(Some(map)), desc, ());
+            let out = node.process(input.clone(), ctx());
             interior_mean_abs_diff(&input, &out, 16)
         };
         let (e1, e2) = (err_at(1), err_at(2));
@@ -523,7 +536,9 @@ mod tests {
             edge_mean_abs_diff(&input, &out, 6)
         };
         // 端をまたぐよう大きめの振幅。
-        let base = DisplacementDescriptor::new().amplitude(20.0).squaring_steps(5);
+        let base = DisplacementDescriptor::new()
+            .amplitude(20.0)
+            .squaring_steps(5);
         let no_pad = edge_err(base.padding(0));
         let auto_pad = edge_err(base); // padding=None → amplitude(=20) 相当
         assert!(
@@ -535,21 +550,37 @@ mod tests {
     /// 出力サイズはパディングに関わらず入力と同じ（クロップで戻る）。
     #[test]
     fn padding_preserves_output_size() {
-        let desc = DisplacementDescriptor::new().amplitude(10.0).squaring_steps(4).padding(12);
+        let desc = DisplacementDescriptor::new()
+            .amplitude(10.0)
+            .squaring_steps(4)
+            .padding(12);
         let (input, out) = run(desc);
         assert_eq!((out.width(), out.height()), (input.width(), input.height()));
     }
 
-    /// 両上流の短い方でストリームが終わる（map 1 枚 → 1 フレームで枯渇）。
+    /// map が枯渇したら直近フレームを据え置く（2 フレーム目も同じワープ結果になる）。
     #[test]
-    fn ends_with_shorter_input() {
+    fn holds_last_map_frame() {
         let mut node = InvertibleDisplacementMap::new(
-            Once(Some(pattern(32, 32))),
-            Once(Some(velocity_map(32, 32))),
-            DisplacementDescriptor::new().squaring_steps(3),
+            Once(Some(velocity_map(32, 32))), // map は 1 枚だけ
+            DisplacementDescriptor::new().amplitude(8.0).squaring_steps(3),
             (),
         );
-        assert!(node.next_frame().is_some());
-        assert!(node.next_frame().is_none());
+        let input = pattern(32, 32);
+        let out1 = node.process(input.clone(), ctx());
+        let out2 = node.process(input.clone(), ctx()); // map 枯渇 → 据え置き
+        assert!(frames_equal(&out1, &out2), "据え置きで 2 フレーム目の結果が変わった");
+        // 据え置き中も無変換ではなく、ちゃんとワープされている。
+        assert!(interior_mean_abs_diff(&input, &out2, 4) > 1.0, "据え置きフレームが素通しされた");
+    }
+
+    /// map が一度も来ない場合は主入力を素通しする。
+    #[test]
+    fn passthrough_without_map() {
+        let mut node =
+            InvertibleDisplacementMap::new(Empty, DisplacementDescriptor::new(), ());
+        let input = pattern(16, 16);
+        let out = node.process(input.clone(), ctx());
+        assert!(frames_equal(&input, &out), "map 無しで素通しになっていない");
     }
 }
