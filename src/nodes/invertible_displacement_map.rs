@@ -15,7 +15,7 @@ pub(crate) mod warp;
 
 use video_pipeline::{Frame, FrameCtx, Pipeline, Process};
 
-use field::{integrate_svf, upsample_field, velocity_from_map, Field};
+use field::{integrate_svf, pad_field_clamp, upsample_field, velocity_from_map, Field};
 use warp::{downsample_image, upsample_image, warp_image, FloatImage};
 
 /// ワープの方向。順ワープ(φ⁻¹) と 逆ワープ(φ) のどちらを適用するか。
@@ -92,6 +92,14 @@ pub struct DisplacementDescriptor {
     pub precision: IntermediatePrecision,
     /// 適用するワープ方向（順のみ／逆のみ／両方）。
     pub warp_mode: WarpMode,
+    /// 中間キャンバスを外側に広げるパディング量（1×-px、片側）。
+    ///
+    /// 端をまたぐ変位で生じる引き伸ばし（[`FloatImage::bilinear`](warp::FloatImage::bilinear) の
+    /// 端クランプ由来）を抑える。`None`（既定）なら [`amplitude`](Self::amplitude) と同サイズに
+    /// 自動設定する（＝変位ピークを概ねカバー）。source は mirror（鏡像反射）で拡張し、
+    /// 出力時に中央をクロップして元サイズに戻す。Roundtrip では可視領域の忠実度がほぼ完全に回復し、
+    /// ForwardOnly では最外周の滲みが「鏡像の続き」に置き換わって見栄えが改善する。
+    pub padding: Option<u32>,
 }
 
 impl Default for DisplacementDescriptor {
@@ -103,6 +111,7 @@ impl Default for DisplacementDescriptor {
             field_divisor: 1,
             precision: IntermediatePrecision::F32,
             warp_mode: WarpMode::Roundtrip,
+            padding: None,
         }
     }
 }
@@ -147,6 +156,19 @@ impl DisplacementDescriptor {
     pub const fn warp_mode(mut self, m: WarpMode) -> Self {
         self.warp_mode = m;
         self
+    }
+
+    /// パディング量（1×-px、片側）を明示設定する。`0` で無効。
+    ///
+    /// 未設定（既定 `None`）なら [`amplitude`](Self::amplitude) と同サイズに自動設定される。
+    pub const fn padding(mut self, px: u32) -> Self {
+        self.padding = Some(px);
+        self
+    }
+
+    /// 実際に使うパディング量（1×-px）。`None` は `amplitude` 切り上げに解決する。
+    fn resolved_padding(&self) -> u32 {
+        self.padding.unwrap_or_else(|| self.amplitude.max(0.0).ceil() as u32)
     }
 }
 
@@ -228,6 +250,10 @@ impl<S: Pipeline, M: Pipeline, P: Process> Pipeline for InvertibleDisplacementMa
 
 /// 速度場 `v`（field 解像度・field-grid px 単位）を SVF 積分し、`source` に対して
 /// **順ワープ(φ⁻¹) → 内側 Process → 逆ワープ(φ) → ダウンサンプル**を適用する共通エンジン。
+///
+/// `desc.padding` 分だけ中間キャンバスを外側に広げて計算し、最後に中央をクロップする。これにより
+/// 端をまたぐ変位の clamp（引き伸ばし）を抑える。速度場は積分前に端クランプで margin 拡張し、
+/// source は mirror で拡張する。
 fn warp_with_field<P: Process>(
     desc: &DisplacementDescriptor,
     inner: &mut P,
@@ -240,7 +266,15 @@ fn warp_with_field<P: Process>(
     let div = desc.field_divisor.max(1) as usize;
     let n = desc.squaring_steps;
 
-    // 1〜2. φ・φ⁻¹ を warp_mode が要求する向きだけ積分。
+    // パディング: field 格子マージン mf（セル）と、それに対応する画像 1×-px マージン mpx = mf*div。
+    // field と画像で同じ物理領域を覆わせるため div の倍数に揃える。
+    let mf = (desc.resolved_padding() as usize).div_ceil(div);
+    let mpx = mf * div;
+
+    // 0. 速度場を端クランプで拡張（margin 内は端の変位を保持＝平行移動なので折りたたみを生まない）。
+    let v = if mf > 0 { pad_field_clamp(&v, mf) } else { v };
+
+    // 1〜2. φ・φ⁻¹ を warp_mode が要求する向きだけ拡張ドメインで積分。
     let phi = desc.warp_mode.uses_inverse().then(|| integrate_svf(&v, n));
     let phi_inv = desc.warp_mode.uses_forward().then(|| {
         let neg = Field {
@@ -252,16 +286,22 @@ fn warp_with_field<P: Process>(
         integrate_svf(&neg, n)
     });
 
-    // 3. k× 画像解像度へアップサンプル（変位ベクトルも k*div 倍）。
-    let (wk, hk) = (w * k, h * k);
+    // 3. 拡張画像（1×: (w+2mpx, h+2mpx)）の k× 解像度へアップサンプル（変位ベクトルも k*div 倍）。
+    let (wp, hp) = (w + 2 * mpx, h + 2 * mpx);
+    let (wk, hk) = (wp * k, hp * k);
     let vec_scale = (k * div) as f32;
     let quantize = desc.precision == IntermediatePrecision::U8;
     let upsample_to_k = |f: Field| upsample_field(&f, wk, hk, vec_scale);
     let phi_k = phi.map(upsample_to_k);
     let phi_inv_k = phi_inv.map(upsample_to_k);
 
-    // 4. 入力を k× へ。
-    let mut img_k = upsample_image(&FloatImage::from_frame(source), k);
+    // 4. 入力を mirror で拡張してから k× へ。
+    let src_img = if mpx > 0 {
+        FloatImage::from_frame_mirror_padded(source, mpx)
+    } else {
+        FloatImage::from_frame(source)
+    };
+    let mut img_k = upsample_image(&src_img, k);
     if quantize {
         img_k.quantize_u8();
     }
@@ -283,8 +323,10 @@ fn warp_with_field<P: Process>(
         r_k.quantize_u8();
     }
 
-    // 8. 1× へダウンサンプルして返す（唯一の不可避な床）。
-    downsample_image(&r_k, k).to_frame(ctx)
+    // 8. 1×（拡張サイズ）へダウンサンプル → 中央 (w, h) をクロップして返す。
+    let down = downsample_image(&r_k, k);
+    let out = if mpx > 0 { down.crop(mpx) } else { down };
+    out.to_frame(ctx)
 }
 
 #[cfg(test)]
@@ -336,6 +378,27 @@ mod tests {
         let mut n = 0u64;
         for y in margin..h - margin {
             for x in margin..w - margin {
+                let (pa, pb) = (a.get_pixel(x, y), b.get_pixel(x, y));
+                sum += (pa.r as f32 - pb.r as f32).abs() as f64;
+                sum += (pa.g as f32 - pb.g as f32).abs() as f64;
+                sum += (pa.b as f32 - pb.b as f32).abs() as f64;
+                n += 3;
+            }
+        }
+        (sum / n as f64) as f32
+    }
+
+    /// 端から `band` px 以内（外周リング）の平均絶対差。引き伸ばしは端で起きるのでそこを測る。
+    fn edge_mean_abs_diff(a: &Frame, b: &Frame, band: u32) -> f32 {
+        let (w, h) = (a.width(), a.height());
+        let mut sum = 0.0f64;
+        let mut n = 0u64;
+        for y in 0..h {
+            for x in 0..w {
+                let on_edge = x < band || x >= w - band || y < band || y >= h - band;
+                if !on_edge {
+                    continue;
+                }
                 let (pa, pb) = (a.get_pixel(x, y), b.get_pixel(x, y));
                 sum += (pa.r as f32 - pb.r as f32).abs() as f64;
                 sum += (pa.g as f32 - pb.g as f32).abs() as f64;
@@ -447,6 +510,34 @@ mod tests {
         };
         let (e1, e2) = (err_at(1), err_at(2));
         assert!(e2 <= e1 + 1.0, "k=2({e2}) が k=1({e1}) より 1.0 以上悪化");
+    }
+
+    /// パディングが Roundtrip の端の引き伸ばし（端誤差）を減らすこと。
+    ///
+    /// 大振幅で端をまたぐ変位を起こし、`padding(0)`（無効）と `padding`=既定（amplitude 相当）で
+    /// 外周リングの誤差を比較する。
+    #[test]
+    fn padding_reduces_edge_stretch() {
+        let edge_err = |desc: DisplacementDescriptor| {
+            let (input, out) = run(desc);
+            edge_mean_abs_diff(&input, &out, 6)
+        };
+        // 端をまたぐよう大きめの振幅。
+        let base = DisplacementDescriptor::new().amplitude(20.0).squaring_steps(5);
+        let no_pad = edge_err(base.padding(0));
+        let auto_pad = edge_err(base); // padding=None → amplitude(=20) 相当
+        assert!(
+            auto_pad < no_pad,
+            "パディングで端誤差が改善しない: auto={auto_pad}, none={no_pad}"
+        );
+    }
+
+    /// 出力サイズはパディングに関わらず入力と同じ（クロップで戻る）。
+    #[test]
+    fn padding_preserves_output_size() {
+        let desc = DisplacementDescriptor::new().amplitude(10.0).squaring_steps(4).padding(12);
+        let (input, out) = run(desc);
+        assert_eq!((out.width(), out.height()), (input.width(), input.height()));
     }
 
     /// 両上流の短い方でストリームが終わる（map 1 枚 → 1 フレームで枯渇）。

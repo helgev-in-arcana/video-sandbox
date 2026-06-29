@@ -3,6 +3,20 @@ use video_pipeline::{Frame, FrameCtx, Pixel};
 
 use super::field::Field;
 
+/// 座標 `i` を `[0, n)` へ鏡像反射（reflect-101: 端ピクセルを重複させない折り返し）で写す。
+#[inline]
+fn reflect(i: isize, n: isize) -> usize {
+    if n <= 1 {
+        return 0;
+    }
+    let period = 2 * (n - 1);
+    let mut m = i.rem_euclid(period);
+    if m >= n {
+        m = period - m;
+    }
+    m as usize
+}
+
 /// f32 精度の中間画像（RGBA, 0..255 レンジで [`Pixel`] と整合）。
 ///
 /// ワープ・アップ／ダウンサンプルの再標本化を f32 で行い、毎ステップの 8bit 量子化を避ける
@@ -28,6 +42,36 @@ impl FloatImage {
                 let p = frame.get_pixel(x as u32, y as u32);
                 *slot = [p.r as f32, p.g as f32, p.b as f32, p.a as f32];
             }
+        });
+        Self { w, h, data }
+    }
+
+    /// [`Frame`] を四方に `m` px だけ **mirror（鏡像反射, reflect-101）**で拡張して f32 画像にする。
+    ///
+    /// 拡張領域には端を折り返した実データの「続き」が入るので、端をまたぐワープでも clamp による
+    /// 引き伸ばしでなく自然な連続に見える。`m == 0` なら [`from_frame`](Self::from_frame) と等価。
+    pub fn from_frame_mirror_padded(frame: &Frame, m: usize) -> Self {
+        let (w, h) = (frame.width() as usize, frame.height() as usize);
+        let (pw, ph) = (w + 2 * m, h + 2 * m);
+        let mut data = vec![[0.0f32; 4]; pw * ph];
+        data.par_chunks_mut(pw).enumerate().for_each(|(yy, row)| {
+            let sy = reflect(yy as isize - m as isize, h as isize);
+            for (xx, slot) in row.iter_mut().enumerate() {
+                let sx = reflect(xx as isize - m as isize, w as isize);
+                let p = frame.get_pixel(sx as u32, sy as u32);
+                *slot = [p.r as f32, p.g as f32, p.b as f32, p.a as f32];
+            }
+        });
+        Self { w: pw, h: ph, data }
+    }
+
+    /// 四方の `m` px を捨てて中央 `(w-2m)×(h-2m)` を切り出す。
+    pub fn crop(&self, m: usize) -> Self {
+        let (w, h) = (self.w - 2 * m, self.h - 2 * m);
+        let mut data = vec![[0.0f32; 4]; w * h];
+        data.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+            let base = (y + m) * self.w + m;
+            row.copy_from_slice(&self.data[base..base + w]);
         });
         Self { w, h, data }
     }

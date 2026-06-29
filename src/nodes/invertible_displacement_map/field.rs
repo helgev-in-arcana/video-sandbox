@@ -79,6 +79,30 @@ pub fn velocity_from_map(
     field
 }
 
+/// 速度場を四方に `m` セルだけ端クランプ拡張する（積分前のパディング用）。
+///
+/// margin 内は最外周の変位値を保持する。一定変位＝平行移動なのでヤコビアンは恒等（det=1）で
+/// 折りたたみを生まず、SVF 積分の微分同相性を壊さない。
+pub fn pad_field_clamp(v: &Field, m: usize) -> Field {
+    let (w, h) = (v.w, v.h);
+    let (pw, ph) = (w + 2 * m, h + 2 * m);
+    let mut out = Field::zeros(pw, ph);
+    out.vx
+        .par_chunks_mut(pw)
+        .zip(out.vy.par_chunks_mut(pw))
+        .enumerate()
+        .for_each(|(yy, (vx_row, vy_row))| {
+            let sy = (yy as isize - m as isize).clamp(0, h as isize - 1) as usize;
+            for xx in 0..pw {
+                let sx = (xx as isize - m as isize).clamp(0, w as isize - 1) as usize;
+                let i = sy * w + sx;
+                vx_row[xx] = v.vx[i];
+                vy_row[xx] = v.vy[i];
+            }
+        });
+    out
+}
+
 /// squaring 1 ステップ。`φ∘φ` を変位形で書くと `d'(x) = d(x) + d(x + d(x))`（スペック §3.3）。
 fn square(src: &Field, dst: &mut Field) {
     let w = src.w;
